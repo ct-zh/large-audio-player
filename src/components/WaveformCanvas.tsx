@@ -6,6 +6,8 @@ interface WaveformCanvasProps {
   durationSec: number;
   points: WaveformPoint[];
   view: WaveformView;
+  windowStartSec: number;
+  windowEndSec: number;
   onSeek: (timeSec: number) => void;
 }
 
@@ -35,6 +37,8 @@ export function WaveformCanvas({
   durationSec,
   points,
   view,
+  windowStartSec,
+  windowEndSec,
   onSeek
 }: WaveformCanvasProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -69,14 +73,22 @@ export function WaveformCanvas({
     const barWidth = Math.max(1, view.zoom * 1.4);
     const totalWidth = points.length * barWidth;
     const visibleCount = Math.max(1, Math.ceil(cssWidth / barWidth));
-    const progressRatio = durationSec > 0 ? currentTimeSec / durationSec : 0;
+    const windowSpanSec = Math.max(0.001, windowEndSec - windowStartSec);
+    const isWindowed = windowSpanSec < Math.max(durationSec - 0.001, 0.001);
+    const progressRatio = isWindowed
+      ? Math.max(0, Math.min(1, (currentTimeSec - windowStartSec) / windowSpanSec))
+      : durationSec > 0
+        ? currentTimeSec / durationSec
+        : 0;
     const progressX = cssWidth * progressRatio;
     const amplitudeScale = (cssHeight * 0.42) * view.amplitude;
     const offsetRatio = Math.max(0, progressRatio - 0.45);
-    const startIndex = Math.min(
-      Math.max(0, Math.floor(offsetRatio * points.length)),
-      Math.max(0, points.length - visibleCount)
-    );
+    const startIndex = isWindowed
+      ? 0
+      : Math.min(
+          Math.max(0, Math.floor(offsetRatio * points.length)),
+          Math.max(0, points.length - visibleCount)
+        );
 
     context.strokeStyle = palette.grid;
     context.lineWidth = 1;
@@ -130,7 +142,12 @@ export function WaveformCanvas({
       onClick={(event) => {
         const rect = event.currentTarget.getBoundingClientRect();
         const ratio = (event.clientX - rect.left) / rect.width;
-        onSeek(ratio * durationSec);
+        const clickWindowSpanSec = Math.max(0.001, windowEndSec - windowStartSec);
+        const clickIsWindowed = clickWindowSpanSec < Math.max(durationSec - 0.001, 0.001);
+        const timeSec = clickIsWindowed
+          ? windowStartSec + ratio * clickWindowSpanSec
+          : ratio * durationSec;
+        onSeek(timeSec);
       }}
     />
   );

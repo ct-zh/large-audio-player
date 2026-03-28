@@ -100,19 +100,23 @@ export const bridge = {
   async requestWaveformOverview(
     path: string,
     file?: File,
-    pointCount = 720
+    pointCount = 720,
+    windowStartSec?: number,
+    windowEndSec?: number
   ): Promise<WaveformOverviewPayload> {
     if (isTauri()) {
       return window.__TAURI__!.core!.invoke<WaveformOverviewPayload>(
         "request_waveform_overview",
-        { path, pointCount }
+        { path, pointCount, windowStartSec, windowEndSec }
       );
     }
 
     return {
       points: generateMockWaveform(file?.size ?? path.length, pointCount),
       progress: 1,
-      resolution: pointCount > 720 ? "detail" : "overview"
+      resolution: pointCount > 720 ? "detail" : "overview",
+      windowStartSec: windowStartSec ?? 0,
+      windowEndSec: windowEndSec ?? mockDuration(file?.size ?? 0)
     };
   },
   async closeCurrentAudio(): Promise<void> {

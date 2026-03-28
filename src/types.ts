@@ -34,6 +34,8 @@ export interface WaveformOverviewPayload {
   points: WaveformPoint[];
   progress: number;
   resolution: "overview" | "detail";
+  windowStartSec: number;
+  windowEndSec: number;
 }
 
 export interface PlayerState {
@@ -47,6 +49,8 @@ export interface PlayerState {
   currentTimeSec: number;
   durationSec: number;
   isPlaying: boolean;
+  waveformWindowStartSec: number;
+  waveformWindowEndSec: number;
 }
 
 export interface OpenAudioResult {

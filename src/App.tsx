@@ -26,7 +26,9 @@ const initialState: PlayerState = {
   eq: defaultEq,
   currentTimeSec: 0,
   durationSec: 0,
-  isPlaying: false
+  isPlaying: false,
+  waveformWindowStartSec: 0,
+  waveformWindowEndSec: 0
 };
 
 const formatBytes = (bytes: number) => {
@@ -65,6 +67,24 @@ const waveformTargetPoints = (zoom: number) => {
   }
 
   return 720;
+};
+
+const waveformWindowForView = (durationSec: number, currentTimeSec: number, zoom: number) => {
+  if (durationSec <= 0 || zoom < 2.5) {
+    return {
+      windowStartSec: 0,
+      windowEndSec: durationSec
+    };
+  }
+
+  const spanSec = Math.max(8, Math.min(durationSec, (durationSec / zoom) * 1.2));
+  const maxStart = Math.max(0, durationSec - spanSec);
+  const start = Math.max(0, Math.min(maxStart, currentTimeSec - spanSec / 2));
+
+  return {
+    windowStartSec: start,
+    windowEndSec: Math.min(durationSec, start + spanSec)
+  };
 };
 
 function App() {
@@ -110,18 +130,43 @@ function App() {
       return;
     }
 
+    const nextWindow = waveformWindowForView(state.durationSec, state.currentTimeSec, view.zoom);
+    const currentSpan = state.waveformWindowEndSec - state.waveformWindowStartSec;
+    const nextSpan = nextWindow.windowEndSec - nextWindow.windowStartSec;
+    const needsDetailRefresh =
+      view.zoom >= 2.5 &&
+      (currentSpan <= 0 ||
+        state.currentTimeSec < state.waveformWindowStartSec + currentSpan * 0.25 ||
+        state.currentTimeSec > state.waveformWindowEndSec - currentSpan * 0.25 ||
+        Math.abs(currentSpan - nextSpan) > 0.5);
+
+    const needsOverviewRefresh = view.zoom < 2.5 && currentSpan !== state.durationSec;
+
+    if (!needsDetailRefresh && !needsOverviewRefresh) {
+      return;
+    }
+
     const timer = window.setTimeout(() => {
       void bridge.requestWaveformOverview(
         currentMeta.path,
         undefined,
-        waveformTargetPoints(view.zoom)
+        waveformTargetPoints(view.zoom),
+        nextWindow.windowStartSec,
+        nextWindow.windowEndSec
       );
     }, 180);
 
     return () => {
       window.clearTimeout(timer);
     };
-  }, [currentMeta, view.zoom]);
+  }, [
+    currentMeta,
+    state.currentTimeSec,
+    state.durationSec,
+    state.waveformWindowEndSec,
+    state.waveformWindowStartSec,
+    view.zoom
+  ]);
 
   const statusLabel = useMemo(() => {
     if (state.phase === "loading") {
@@ -187,12 +232,14 @@ function App() {
   };
 
   const handleWaveformUpdate = (payload: WaveformOverviewPayload) => {
-    setState((prev) => ({
-      ...prev,
-      waveform: payload.points.length > 0 ? payload.points : prev.waveform,
-      waveformProgress: payload.progress,
-      phase: prev.audioMeta ? "ready" : prev.phase
-    }));
+      setState((prev) => ({
+        ...prev,
+        waveform: payload.points.length > 0 ? payload.points : prev.waveform,
+        waveformProgress: payload.progress,
+        phase: prev.audioMeta ? "ready" : prev.phase,
+        waveformWindowStartSec: payload.windowStartSec,
+        waveformWindowEndSec: payload.windowEndSec
+      }));
   };
 
   const handleFile = async (file: File) => {
@@ -223,7 +270,9 @@ function App() {
       const overview = await bridge.requestWaveformOverview(
         requestPath,
         file,
-        waveformTargetPoints(view.zoom)
+        waveformTargetPoints(view.zoom),
+        0,
+        audioMeta.durationSec
       );
 
       setState((prev) => ({
@@ -232,7 +281,9 @@ function App() {
         audioMeta,
         durationSec: audioMeta.durationSec,
         waveform: overview.points,
-        waveformProgress: overview.progress
+        waveformProgress: overview.progress,
+        waveformWindowStartSec: overview.windowStartSec,
+        waveformWindowEndSec: overview.windowEndSec
       }));
     } catch (error) {
       setState((prev) => ({
@@ -530,6 +581,8 @@ function App() {
                   durationSec={state.durationSec}
                   points={state.waveform}
                   view={view}
+                  windowStartSec={state.waveformWindowStartSec}
+                  windowEndSec={state.waveformWindowEndSec || state.durationSec}
                   onSeek={(timeSec) => {
                     void handleSeek(timeSec);
                   }}

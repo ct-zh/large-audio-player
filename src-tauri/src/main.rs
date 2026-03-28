@@ -6,7 +6,7 @@ use std::{
     collections::HashMap,
     fs::File,
     io::BufReader,
-    path::Path,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, Sender},
@@ -14,6 +14,12 @@ use std::{
     },
     thread,
     time::Duration,
+};
+use std::{
+    collections::hash_map::DefaultHasher,
+    fs,
+    hash::{Hash, Hasher},
+    time::UNIX_EPOCH,
 };
 use symphonia::core::{
     audio::{AudioBufferRef, SampleBuffer},
@@ -33,7 +39,7 @@ struct AppState {
     current_file: Mutex<Option<AudioMeta>>,
     playback: PlaybackController,
     waveform_generation: AtomicU64,
-    waveform_cache: Mutex<HashMap<String, HashMap<usize, Vec<WaveformPoint>>>>,
+    waveform_cache: Mutex<HashMap<String, HashMap<String, Vec<WaveformPoint>>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,7 +67,7 @@ struct EqSettings {
     high: f32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WaveformPoint {
     min: f32,
@@ -74,6 +80,8 @@ struct WaveformOverviewPayload {
     points: Vec<WaveformPoint>,
     progress: f32,
     resolution: String,
+    window_start_sec: f64,
+    window_end_sec: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -381,22 +389,117 @@ fn duration_from_codec_params(codec_params: &CodecParameters) -> u64 {
     0
 }
 
-fn append_audio_buffer(buffer: AudioBufferRef<'_>, accumulator: &mut WaveformAccumulator) {
+fn append_audio_buffer_windowed(
+    buffer: AudioBufferRef<'_>,
+    accumulator: &mut WaveformAccumulator,
+    frame_cursor: &mut u64,
+    frame_start: Option<u64>,
+    frame_end: Option<u64>,
+) -> bool {
     let channels = buffer.spec().channels.count().max(1);
     let mut sample_buffer = SampleBuffer::<f32>::new(buffer.capacity() as u64, *buffer.spec());
     sample_buffer.copy_interleaved_ref(buffer);
 
     for frame in sample_buffer.samples().chunks(channels) {
-        let mut frame_min = 1.0_f32;
-        let mut frame_max = -1.0_f32;
+        let current_frame = *frame_cursor;
 
-        for sample in frame {
-            frame_min = frame_min.min(*sample);
-            frame_max = frame_max.max(*sample);
+        if let Some(end) = frame_end {
+          if current_frame >= end {
+            return true;
+          }
         }
 
-        accumulator.push_frame(frame_min, frame_max);
+        if frame_start.is_none_or(|start| current_frame >= start) {
+            let mut frame_min = 1.0_f32;
+            let mut frame_max = -1.0_f32;
+
+            for sample in frame {
+                frame_min = frame_min.min(*sample);
+                frame_max = frame_max.max(*sample);
+            }
+
+            accumulator.push_frame(frame_min, frame_max);
+        }
+
+        *frame_cursor += 1;
     }
+
+    false
+}
+
+fn waveform_cache_dir(app: &AppHandle) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_cache_dir()
+        .map_err(|error| error.to_string())?
+        .join("waveforms");
+    fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    Ok(dir)
+}
+
+fn waveform_memory_key(point_count: usize, window_start_sec: f64, window_end_sec: f64) -> String {
+    format!("{point_count}:{window_start_sec:.3}:{window_end_sec:.3}")
+}
+
+fn waveform_cache_file(
+    path: &str,
+    point_count: usize,
+    window_start_sec: f64,
+    window_end_sec: f64,
+    app: &AppHandle,
+) -> Result<PathBuf, String> {
+    let metadata = fs::metadata(path).map_err(|error| error.to_string())?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .map(|value| value.as_secs())
+        .unwrap_or(0);
+
+    let mut hasher = DefaultHasher::new();
+    path.hash(&mut hasher);
+    metadata.len().hash(&mut hasher);
+    modified.hash(&mut hasher);
+    point_count.hash(&mut hasher);
+    format!("{window_start_sec:.3}").hash(&mut hasher);
+    format!("{window_end_sec:.3}").hash(&mut hasher);
+    let file_name = format!("{:016x}.json", hasher.finish());
+
+    Ok(waveform_cache_dir(app)?.join(file_name))
+}
+
+fn load_waveform_from_disk(
+    path: &str,
+    point_count: usize,
+    window_start_sec: f64,
+    window_end_sec: f64,
+    app: &AppHandle,
+) -> Result<Option<Vec<WaveformPoint>>, String> {
+    let cache_file =
+        waveform_cache_file(path, point_count, window_start_sec, window_end_sec, app)?;
+
+    if !cache_file.exists() {
+        return Ok(None);
+    }
+
+    let contents = fs::read_to_string(cache_file).map_err(|error| error.to_string())?;
+    let points =
+        serde_json::from_str::<Vec<WaveformPoint>>(&contents).map_err(|error| error.to_string())?;
+    Ok(Some(points))
+}
+
+fn save_waveform_to_disk(
+    path: &str,
+    point_count: usize,
+    window_start_sec: f64,
+    window_end_sec: f64,
+    points: &[WaveformPoint],
+    app: &AppHandle,
+) -> Result<(), String> {
+    let cache_file =
+        waveform_cache_file(path, point_count, window_start_sec, window_end_sec, app)?;
+    let contents = serde_json::to_string(points).map_err(|error| error.to_string())?;
+    fs::write(cache_file, contents).map_err(|error| error.to_string())
 }
 
 fn build_waveform_overview(
@@ -405,11 +508,28 @@ fn build_waveform_overview(
     state: Arc<AppState>,
     job_id: u64,
     point_count: usize,
+    window_start_sec: f64,
+    window_end_sec: f64,
 ) -> Result<(), String> {
     let mut context = open_decoding_context(Path::new(&path))?;
-    let total_frames = context.decoder.codec_params().n_frames;
-    let mut accumulator = WaveformAccumulator::new(total_frames, point_count);
+    let sample_rate = context.audio_meta.sample_rate as f64;
+    let frame_start = if window_start_sec > 0.0 {
+        Some((window_start_sec * sample_rate).floor() as u64)
+    } else {
+        None
+    };
+    let frame_end = if window_end_sec > 0.0 {
+        Some((window_end_sec * sample_rate).ceil() as u64)
+    } else {
+        None
+    };
+    let requested_total_frames = match (frame_start, frame_end) {
+        (Some(start), Some(end)) if end > start => Some(end - start),
+        _ => context.decoder.codec_params().n_frames,
+    };
+    let mut accumulator = WaveformAccumulator::new(requested_total_frames, point_count);
     let mut last_emitted_bucket = 0_u8;
+    let mut frame_cursor = 0_u64;
     let resolution = if point_count > DEFAULT_OVERVIEW_POINTS {
         "detail"
     } else {
@@ -420,6 +540,8 @@ fn build_waveform_overview(
         points: Vec::new(),
         progress: 0.02,
         resolution: resolution.to_string(),
+        window_start_sec,
+        window_end_sec,
     };
 
     let _ = app.emit("waveform_progress", initial_payload);
@@ -445,7 +567,13 @@ fn build_waveform_overview(
 
         match context.decoder.decode(&packet) {
             Ok(audio_buffer) => {
-                append_audio_buffer(audio_buffer, &mut accumulator);
+                let reached_end = append_audio_buffer_windowed(
+                    audio_buffer,
+                    &mut accumulator,
+                    &mut frame_cursor,
+                    frame_start,
+                    frame_end,
+                );
 
                 if let Some(progress) = accumulator.progress() {
                     let bucket = (progress * 10.0).floor() as u8;
@@ -457,9 +585,15 @@ fn build_waveform_overview(
                                 points: Vec::new(),
                                 progress,
                                 resolution: resolution.to_string(),
+                                window_start_sec,
+                                window_end_sec,
                             },
                         );
                     }
+                }
+
+                if reached_end {
+                    break;
                 }
             }
             Err(SymphoniaError::DecodeError(_)) => continue,
@@ -478,6 +612,8 @@ fn build_waveform_overview(
         points: accumulator.finalize(),
         progress: 1.0,
         resolution: resolution.to_string(),
+        window_start_sec,
+        window_end_sec,
     };
 
     if let Ok(mut cache) = state.waveform_cache.lock() {
@@ -489,8 +625,20 @@ fn build_waveform_overview(
 
         cache.entry(path.clone())
             .or_default()
-            .insert(point_count, ready_payload.points.clone());
+            .insert(
+                waveform_memory_key(point_count, window_start_sec, window_end_sec),
+                ready_payload.points.clone(),
+            );
     }
+
+    let _ = save_waveform_to_disk(
+        &path,
+        point_count,
+        window_start_sec,
+        window_end_sec,
+        &ready_payload.points,
+        &app,
+    );
 
     let _ = app.emit(
         "waveform_progress",
@@ -498,6 +646,8 @@ fn build_waveform_overview(
             points: Vec::new(),
             progress: 1.0,
             resolution: resolution.to_string(),
+            window_start_sec,
+            window_end_sec,
         },
     );
     let _ = app.emit("waveform_overview_ready", ready_payload);
@@ -822,8 +972,17 @@ fn request_waveform_overview(
     app: AppHandle,
     state: State<'_, Arc<AppState>>,
     point_count: Option<usize>,
+    window_start_sec: Option<f64>,
+    window_end_sec: Option<f64>,
 ) -> Result<WaveformOverviewPayload, String> {
     let requested_points = point_count.unwrap_or(DEFAULT_OVERVIEW_POINTS).clamp(360, 4_096);
+    let duration_guess = open_decoding_context(Path::new(&path))?.audio_meta.duration_sec as f64;
+    let requested_window_start = window_start_sec.unwrap_or(0.0).max(0.0);
+    let requested_window_end = window_end_sec
+        .unwrap_or(duration_guess)
+        .max(requested_window_start)
+        .min(duration_guess.max(requested_window_start));
+    let is_windowed = requested_window_start > 0.0 || requested_window_end < duration_guess;
     let resolution = if requested_points > DEFAULT_OVERVIEW_POINTS {
         "detail"
     } else {
@@ -833,17 +992,56 @@ fn request_waveform_overview(
     if let Ok(cache) = state.waveform_cache.lock() {
         if let Some(points) = cache
             .get(&path)
-            .and_then(|layers| layers.get(&requested_points))
+            .and_then(|layers| {
+                layers.get(&waveform_memory_key(
+                    requested_points,
+                    requested_window_start,
+                    requested_window_end,
+                ))
+            })
             .cloned()
         {
             let payload = WaveformOverviewPayload {
                 points,
                 progress: 1.0,
                 resolution: resolution.to_string(),
+                window_start_sec: requested_window_start,
+                window_end_sec: requested_window_end,
             };
             let _ = app.emit("waveform_overview_ready", payload.clone());
             return Ok(payload);
         }
+    }
+
+    if let Ok(Some(points)) = load_waveform_from_disk(
+        &path,
+        requested_points,
+        requested_window_start,
+        requested_window_end,
+        &app,
+    ) {
+        if let Ok(mut cache) = state.waveform_cache.lock() {
+            cache.entry(path.clone())
+                .or_default()
+                .insert(
+                    waveform_memory_key(
+                        requested_points,
+                        requested_window_start,
+                        requested_window_end,
+                    ),
+                    points.clone(),
+                );
+        }
+
+        let payload = WaveformOverviewPayload {
+            points,
+            progress: 1.0,
+            resolution: resolution.to_string(),
+            window_start_sec: requested_window_start,
+            window_end_sec: requested_window_end,
+        };
+        let _ = app.emit("waveform_overview_ready", payload.clone());
+        return Ok(payload);
     }
 
     let job_id = state.waveform_generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -858,6 +1056,8 @@ fn request_waveform_overview(
             state_handle,
             job_id,
             requested_points,
+            if is_windowed { requested_window_start } else { 0.0 },
+            if is_windowed { requested_window_end } else { duration_guess },
         );
     });
 
@@ -865,6 +1065,8 @@ fn request_waveform_overview(
         points: Vec::new(),
         progress: 0.02,
         resolution: resolution.to_string(),
+        window_start_sec: requested_window_start,
+        window_end_sec: requested_window_end,
     })
 }
 
