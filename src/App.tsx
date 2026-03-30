@@ -94,6 +94,7 @@ function App() {
   const isDesktopTauri = bridge.isTauri();
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const objectUrlRef = useRef<string | null>(null);
+  const openRequestIdRef = useRef(0);
   const currentMeta = state.audioMeta;
 
   useEffect(() => {
@@ -232,14 +233,86 @@ function App() {
   };
 
   const handleWaveformUpdate = (payload: WaveformOverviewPayload) => {
+    setState((prev) => ({
+      ...prev,
+      waveform: payload.points.length > 0 ? payload.points : prev.waveform,
+      waveformProgress: payload.progress,
+      phase: prev.audioMeta ? "ready" : prev.phase,
+      waveformWindowStartSec: payload.windowStartSec,
+      waveformWindowEndSec: payload.windowEndSec
+    }));
+  };
+
+  const loadAudio = async (source: { path: string; file?: File }) => {
+    const loadId = openRequestIdRef.current + 1;
+    openRequestIdRef.current = loadId;
+
+    await resetPlaybackSideEffects();
+
+    if (openRequestIdRef.current !== loadId) {
+      return;
+    }
+
+    setState({
+      ...initialState,
+      phase: "loading"
+    });
+
+    try {
+      const { audioMeta } = await bridge.openAudio(source.path, source.file);
+
+      if (openRequestIdRef.current !== loadId) {
+        return;
+      }
+
+      if (source.file) {
+        await applyMetaToLocalAudio(source.file, audioMeta);
+
+        if (openRequestIdRef.current !== loadId) {
+          return;
+        }
+      } else {
+        setState((prev) => ({
+          ...prev,
+          audioMeta,
+          durationSec: audioMeta.durationSec,
+          currentTimeSec: 0
+        }));
+      }
+
+      const overview = await bridge.requestWaveformOverview(
+        source.path,
+        source.file,
+        waveformTargetPoints(view.zoom),
+        0,
+        audioMeta.durationSec
+      );
+
+      if (openRequestIdRef.current !== loadId) {
+        return;
+      }
+
       setState((prev) => ({
         ...prev,
-        waveform: payload.points.length > 0 ? payload.points : prev.waveform,
-        waveformProgress: payload.progress,
-        phase: prev.audioMeta ? "ready" : prev.phase,
-        waveformWindowStartSec: payload.windowStartSec,
-        waveformWindowEndSec: payload.windowEndSec
+        phase: "ready",
+        audioMeta,
+        durationSec: audioMeta.durationSec,
+        waveform: overview.points,
+        waveformProgress: overview.progress,
+        waveformWindowStartSec: overview.windowStartSec,
+        waveformWindowEndSec: overview.windowEndSec
       }));
+    } catch (error) {
+      if (openRequestIdRef.current !== loadId) {
+        return;
+      }
+
+      setState((prev) => ({
+        ...prev,
+        phase: "error",
+        errorMessage: error instanceof Error ? error.message : "Failed to load audio."
+      }));
+    }
   };
 
   const handleFile = async (file: File) => {
@@ -254,44 +327,9 @@ function App() {
       return;
     }
 
-    await resetPlaybackSideEffects();
-
-    setState({
-      ...initialState,
-      phase: "loading"
-    });
-
-    try {
-      const nativePath = getDesktopFilePath(file);
-      const requestPath = nativePath ?? file.name;
-      const { audioMeta } = await bridge.openAudio(requestPath, file);
-      await applyMetaToLocalAudio(file, audioMeta);
-
-      const overview = await bridge.requestWaveformOverview(
-        requestPath,
-        file,
-        waveformTargetPoints(view.zoom),
-        0,
-        audioMeta.durationSec
-      );
-
-      setState((prev) => ({
-        ...prev,
-        phase: "ready",
-        audioMeta,
-        durationSec: audioMeta.durationSec,
-        waveform: overview.points,
-        waveformProgress: overview.progress,
-        waveformWindowStartSec: overview.windowStartSec,
-        waveformWindowEndSec: overview.windowEndSec
-      }));
-    } catch (error) {
-      setState((prev) => ({
-        ...prev,
-        phase: "error",
-        errorMessage: error instanceof Error ? error.message : "Failed to load audio."
-      }));
-    }
+    const nativePath = getDesktopFilePath(file);
+    const requestPath = nativePath ?? file.name;
+    await loadAudio({ path: requestPath, file });
   };
 
   const handleInputChange = async (event: ChangeEvent<HTMLInputElement>) => {
@@ -419,16 +457,7 @@ function App() {
             onClick={async () => {
               const path = await bridge.openSystemAudioPicker();
               if (path) {
-                const { audioMeta } = await bridge.openAudio(path);
-                setState((prev) => ({
-                  ...prev,
-                  phase: "ready",
-                  audioMeta,
-                  durationSec: audioMeta.durationSec,
-                  waveformProgress: 0
-                }));
-                const overview = await bridge.requestWaveformOverview(path);
-                handleWaveformUpdate(overview);
+                await loadAudio({ path });
               }
             }}
           >

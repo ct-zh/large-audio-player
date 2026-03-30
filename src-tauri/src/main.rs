@@ -25,10 +25,11 @@ use symphonia::core::{
     audio::{AudioBufferRef, SampleBuffer},
     codecs::{CodecParameters, DecoderOptions, CODEC_TYPE_NULL},
     errors::Error as SymphoniaError,
-    formats::FormatOptions,
+    formats::{FormatOptions, SeekMode, SeekTo},
     io::MediaSourceStream,
     meta::MetadataOptions,
     probe::Hint,
+    units::Time,
 };
 use tauri::{AppHandle, Emitter, Manager, State};
 
@@ -355,11 +356,16 @@ fn open_decoding_context(path: &Path) -> Result<DecodingContext, String> {
         .unwrap_or("audio-file")
         .to_string();
 
+    let mut duration_sec = duration_from_codec_params(&codec_params);
+    if duration_sec == 0 {
+        duration_sec = estimate_duration_from_packets(path, track_id, &codec_params)?;
+    }
+
     let audio_meta = AudioMeta {
         path: path.to_string_lossy().to_string(),
         file_name,
         file_size,
-        duration_sec: duration_from_codec_params(&codec_params),
+        duration_sec,
         sample_rate: codec_params.sample_rate.unwrap_or(44_100),
         channels: codec_params
             .channels
@@ -387,6 +393,70 @@ fn duration_from_codec_params(codec_params: &CodecParameters) -> u64 {
     }
 
     0
+}
+
+fn seconds_from_timestamp(timestamp: u64, codec_params: &CodecParameters) -> Option<f64> {
+    if timestamp == 0 {
+        return Some(0.0);
+    }
+
+    if let Some(time_base) = codec_params.time_base {
+        let time = time_base.calc_time(timestamp);
+        return Some(time.seconds as f64 + time.frac);
+    }
+
+    codec_params
+        .sample_rate
+        .filter(|sample_rate| *sample_rate > 0)
+        .map(|sample_rate| timestamp as f64 / sample_rate as f64)
+}
+
+fn estimate_duration_from_packets(
+    path: &Path,
+    track_id: u32,
+    codec_params: &CodecParameters,
+) -> Result<u64, String> {
+    let file = File::open(path).map_err(|error| error.to_string())?;
+
+    let mut hint = Hint::new();
+    if let Some(extension) = path.extension().and_then(|value| value.to_str()) {
+        hint.with_extension(extension);
+    }
+
+    let media_source = MediaSourceStream::new(Box::new(file), Default::default());
+    let mut format = symphonia::default::get_probe()
+        .format(
+            &hint,
+            media_source,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
+        .map_err(decode_error)?
+        .format;
+
+    let mut duration_ts = 0_u64;
+
+    loop {
+        let packet = match format.next_packet() {
+            Ok(packet) => packet,
+            Err(SymphoniaError::IoError(error))
+                if error.kind() == std::io::ErrorKind::UnexpectedEof =>
+            {
+                break;
+            }
+            Err(error) => return Err(decode_error(error)),
+        };
+
+        if packet.track_id() != track_id {
+            continue;
+        }
+
+        duration_ts = duration_ts.max(packet.ts().saturating_add(packet.dur()));
+    }
+
+    Ok(seconds_from_timestamp(duration_ts, codec_params)
+        .map(|seconds| seconds.ceil() as u64)
+        .unwrap_or(0))
 }
 
 fn append_audio_buffer_windowed(
@@ -535,6 +605,22 @@ fn build_waveform_overview(
     } else {
         "overview"
     };
+
+    if window_start_sec > 0.0 {
+        if let Ok(seeked_to) = context.format.seek(
+            SeekMode::Accurate,
+            SeekTo::Time {
+                time: Time::from(window_start_sec),
+                track_id: Some(context.track_id),
+            },
+        ) {
+            context.decoder.reset();
+
+            frame_cursor = seconds_from_timestamp(seeked_to.actual_ts, context.decoder.codec_params())
+                .map(|seconds| (seconds * sample_rate).floor() as u64)
+                .unwrap_or_else(|| frame_start.unwrap_or(0));
+        }
+    }
 
     let initial_payload = WaveformOverviewPayload {
         points: Vec::new(),
@@ -730,6 +816,10 @@ fn emit_playback_status(app: &AppHandle, runtime_state: &Arc<Mutex<PlaybackRunti
     }
 }
 
+fn is_session_playing(session: &PlaybackSession) -> bool {
+    !session.sink.is_paused() && !session.sink.empty()
+}
+
 fn playback_worker(
     receiver: Receiver<PlaybackCommand>,
     runtime_state: Arc<Mutex<PlaybackRuntimeState>>,
@@ -758,7 +848,7 @@ fn playback_worker(
                         update_runtime_status(
                             &runtime_state,
                             current.sink.get_pos().as_secs_f64(),
-                            true,
+                            is_session_playing(current),
                         );
                         emit_playback_status(&app, &runtime_state);
                     });
@@ -773,7 +863,7 @@ fn playback_worker(
                         update_runtime_status(
                             &runtime_state,
                             current.sink.get_pos().as_secs_f64(),
-                            false,
+                            is_session_playing(current),
                         );
                         emit_playback_status(&app, &runtime_state);
                     });
@@ -787,7 +877,7 @@ fn playback_worker(
                             current.path.clone(),
                             current.gain,
                             current.eq.clone(),
-                            !current.sink.is_paused(),
+                            is_session_playing(current),
                         )
                     })
                     .ok_or_else(|| "No audio loaded for playback.".to_string());
@@ -802,7 +892,7 @@ fn playback_worker(
                     update_runtime_status(
                         &runtime_state,
                         position_sec.max(0.0),
-                        !next_session.sink.is_paused(),
+                        is_session_playing(&next_session),
                     );
                     session = Some(next_session);
                     emit_playback_status(&app, &runtime_state);
@@ -820,7 +910,7 @@ fn playback_worker(
                         update_runtime_status(
                             &runtime_state,
                             current.sink.get_pos().as_secs_f64(),
-                            !current.sink.is_paused(),
+                            is_session_playing(current),
                         );
                         emit_playback_status(&app, &runtime_state);
                     });
@@ -834,7 +924,7 @@ fn playback_worker(
                             current.path.clone(),
                             current.gain,
                             current.sink.get_pos(),
-                            !current.sink.is_paused(),
+                            is_session_playing(current),
                         )
                     })
                     .ok_or_else(|| "No audio loaded for playback.".to_string());
@@ -844,7 +934,7 @@ fn playback_worker(
                     update_runtime_status(
                         &runtime_state,
                         position.as_secs_f64(),
-                        !next_session.sink.is_paused(),
+                        is_session_playing(&next_session),
                     );
                     session = Some(next_session);
                     emit_playback_status(&app, &runtime_state);
@@ -856,7 +946,7 @@ fn playback_worker(
                 let status = if let Some(current) = session.as_ref() {
                     PlaybackStatus {
                         position_sec: current.sink.get_pos().as_secs_f64(),
-                        is_playing: !current.sink.is_paused(),
+                        is_playing: is_session_playing(current),
                     }
                 } else {
                     PlaybackStatus {
@@ -880,7 +970,7 @@ fn playback_worker(
                     update_runtime_status(
                         &runtime_state,
                         current.sink.get_pos().as_secs_f64(),
-                        !current.sink.is_paused(),
+                        is_session_playing(current),
                     );
                     emit_playback_status(&app, &runtime_state);
                 }
@@ -976,7 +1066,20 @@ fn request_waveform_overview(
     window_end_sec: Option<f64>,
 ) -> Result<WaveformOverviewPayload, String> {
     let requested_points = point_count.unwrap_or(DEFAULT_OVERVIEW_POINTS).clamp(360, 4_096);
-    let duration_guess = open_decoding_context(Path::new(&path))?.audio_meta.duration_sec as f64;
+    let duration_guess = if let Some(duration_sec) = state
+        .current_file
+        .lock()
+        .ok()
+        .and_then(|current| {
+            current
+                .as_ref()
+                .filter(|audio_meta| audio_meta.path == path)
+                .map(|audio_meta| audio_meta.duration_sec as f64)
+        }) {
+        duration_sec
+    } else {
+        open_decoding_context(Path::new(&path))?.audio_meta.duration_sec as f64
+    };
     let requested_window_start = window_start_sec.unwrap_or(0.0).max(0.0);
     let requested_window_end = window_end_sec
         .unwrap_or(duration_guess)
