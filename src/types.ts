@@ -45,6 +45,7 @@ export interface PlayerState {
   waveform: WaveformPoint[];
   waveformProgress: number;
   gain: number;
+  playbackRate: number;
   eq: EqSettings;
   currentTimeSec: number;
   durationSec: number;

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import type { WaveformPoint, WaveformView } from "../types";
 
 interface WaveformCanvasProps {
@@ -8,29 +8,55 @@ interface WaveformCanvasProps {
   view: WaveformView;
   windowStartSec: number;
   windowEndSec: number;
+  onHoverTimeChange?: (timeSec: number | null) => void;
   onSeek: (timeSec: number) => void;
 }
 
 const colorsByScheme = {
   ocean: {
-    stroke: "#72f1b8",
-    fill: "rgba(54, 96, 100, 0.35)",
-    progress: "#f9fb76",
-    grid: "rgba(255,255,255,0.08)"
+    background: "#0d1a27",
+    stroke: "#bcffe2",
+    fill: "#7cecc5",
+    glow: "rgba(124, 236, 197, 0.34)",
+    progress: "#ffe07e",
+    hover: "#ffd2dc",
+    grid: "rgba(255,255,255,0.12)",
+    label: "#edf8ff"
   },
   sunset: {
-    stroke: "#ffb26b",
-    fill: "rgba(139, 60, 37, 0.3)",
-    progress: "#fff7c2",
-    grid: "rgba(255,255,255,0.08)"
+    background: "#231726",
+    stroke: "#ffd9a6",
+    fill: "#ffb07c",
+    glow: "rgba(255, 176, 124, 0.32)",
+    progress: "#fff2a7",
+    hover: "#ffd6e2",
+    grid: "rgba(255,255,255,0.12)",
+    label: "#fff6f0"
   },
   mono: {
-    stroke: "#d7dedc",
-    fill: "rgba(110, 122, 125, 0.25)",
-    progress: "#ffffff",
-    grid: "rgba(255,255,255,0.08)"
+    background: "#18202a",
+    stroke: "#f3f7fb",
+    fill: "#d9e7f2",
+    glow: "rgba(217, 231, 242, 0.3)",
+    progress: "#fff5bc",
+    hover: "#cfe7ff",
+    grid: "rgba(255,255,255,0.12)",
+    label: "#f5fbff"
   }
 } as const;
+
+const formatHoverTime = (totalSeconds: number) => {
+  const seconds = Math.max(0, Math.floor(totalSeconds));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const remain = seconds % 60;
+
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, "0")}:${String(remain).padStart(2, "0")}`;
+  }
+
+  return `${String(minutes).padStart(2, "0")}:${String(remain).padStart(2, "0")}`;
+};
 
 export function WaveformCanvas({
   currentTimeSec,
@@ -39,10 +65,24 @@ export function WaveformCanvas({
   view,
   windowStartSec,
   windowEndSec,
+  onHoverTimeChange,
   onSeek
 }: WaveformCanvasProps) {
+  const viewportRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const lastManualScrollAtRef = useRef(0);
+  const lastAutoScrollAtRef = useRef(0);
+  const [hoverState, setHoverState] = useState<{ x: number; timeSec: number } | null>(null);
   const palette = useMemo(() => colorsByScheme[view.colorScheme], [view.colorScheme]);
+
+  const cssHeight = 390;
+  const barWidth = Math.max(2, view.zoom * 2.4);
+  const contentWidth = Math.max(640, Math.ceil(points.length * barWidth));
+  const contentSpanSec = Math.max(
+    0.001,
+    windowEndSec > windowStartSec ? windowEndSec - windowStartSec : durationSec
+  );
+  const isWindowed = windowEndSec > windowStartSec && contentSpanSec < Math.max(durationSec, 0.001);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -52,11 +92,11 @@ export function WaveformCanvas({
     }
 
     const dpr = window.devicePixelRatio || 1;
-    const cssWidth = canvas.clientWidth;
-    const cssHeight = canvas.clientHeight;
-
-    canvas.width = Math.floor(cssWidth * dpr);
+    const displayWidth = contentWidth;
+    canvas.width = Math.floor(displayWidth * dpr);
     canvas.height = Math.floor(cssHeight * dpr);
+    canvas.style.width = `${displayWidth}px`;
+    canvas.style.height = `${cssHeight}px`;
 
     const context = canvas.getContext("2d");
 
@@ -64,91 +104,186 @@ export function WaveformCanvas({
       return;
     }
 
-    context.scale(dpr, dpr);
-    context.clearRect(0, 0, cssWidth, cssHeight);
-    context.fillStyle = "rgba(8, 19, 24, 1)";
-    context.fillRect(0, 0, cssWidth, cssHeight);
+    context.setTransform(dpr, 0, 0, dpr, 0, 0);
+    context.clearRect(0, 0, displayWidth, cssHeight);
+    context.fillStyle = palette.background;
+    context.fillRect(0, 0, displayWidth, cssHeight);
 
     const midY = cssHeight / 2;
-    const barWidth = Math.max(1, view.zoom * 1.4);
-    const totalWidth = points.length * barWidth;
-    const visibleCount = Math.max(1, Math.ceil(cssWidth / barWidth));
-    const windowSpanSec = Math.max(0.001, windowEndSec - windowStartSec);
-    const isWindowed = windowSpanSec < Math.max(durationSec - 0.001, 0.001);
-    const progressRatio = isWindowed
-      ? Math.max(0, Math.min(1, (currentTimeSec - windowStartSec) / windowSpanSec))
-      : durationSec > 0
-        ? currentTimeSec / durationSec
-        : 0;
-    const progressX = cssWidth * progressRatio;
-    const amplitudeScale = (cssHeight * 0.42) * view.amplitude;
-    const offsetRatio = Math.max(0, progressRatio - 0.45);
-    const startIndex = isWindowed
-      ? 0
-      : Math.min(
-          Math.max(0, Math.floor(offsetRatio * points.length)),
-          Math.max(0, points.length - visibleCount)
-        );
+    const amplitudeScale = (cssHeight * 0.43) * view.amplitude;
+    const gridStep = Math.max(120, Math.round(180 / Math.max(view.zoom, 0.8)));
 
     context.strokeStyle = palette.grid;
     context.lineWidth = 1;
 
-    for (let x = 0; x <= cssWidth; x += 120) {
+    for (let x = 0; x <= displayWidth; x += gridStep) {
       context.beginPath();
-      context.moveTo(x, 0);
-      context.lineTo(x, cssHeight);
+      context.moveTo(x + 0.5, 0);
+      context.lineTo(x + 0.5, cssHeight);
       context.stroke();
     }
 
+    context.beginPath();
+    context.moveTo(0, midY + 0.5);
+    context.lineTo(displayWidth, midY + 0.5);
+    context.stroke();
+
     context.fillStyle = palette.fill;
-    context.strokeStyle = palette.stroke;
-    context.lineWidth = 1.2;
+    context.shadowColor = palette.glow;
+    context.shadowBlur = 10;
 
-    for (let localIndex = 0; localIndex < visibleCount; localIndex += 1) {
-      const point = points[startIndex + localIndex];
-
-      if (!point) {
-        break;
-      }
-
-      const x = localIndex * barWidth;
+    for (let index = 0; index < points.length; index += 1) {
+      const point = points[index];
+      const x = index * barWidth;
       const top = midY - point.max * amplitudeScale;
       const bottom = midY - point.min * amplitudeScale;
-      const height = Math.max(1.5, bottom - top);
+      const height = Math.max(2, bottom - top);
 
-      context.fillRect(x, top, Math.max(1, barWidth - 1), height);
+      context.fillRect(x, top, Math.max(1.5, barWidth - 1), height);
     }
 
+    context.shadowBlur = 0;
+
+    const progressRatio = isWindowed
+      ? Math.max(0, Math.min(1, (currentTimeSec - windowStartSec) / contentSpanSec))
+      : durationSec > 0
+        ? Math.max(0, Math.min(1, currentTimeSec / durationSec))
+        : 0;
+    const progressX = displayWidth * progressRatio;
+
     context.strokeStyle = palette.progress;
-    context.lineWidth = 2;
+    context.lineWidth = 2.5;
     context.beginPath();
     context.moveTo(progressX, 0);
     context.lineTo(progressX, cssHeight);
     context.stroke();
 
-    context.fillStyle = palette.progress;
+    context.fillStyle = palette.label;
     context.font = "12px monospace";
-    context.fillText(
-      `${Math.round(totalWidth / Math.max(cssWidth, 1))}x data span`,
-      16,
-      20
-    );
-  }, [currentTimeSec, durationSec, palette, points, view]);
+    context.fillText(`${Math.round(contentWidth / 960 * 10) / 10}x`, 16, 20);
+
+    if (hoverState) {
+      context.strokeStyle = palette.hover;
+      context.lineWidth = 1.5;
+      context.beginPath();
+      context.moveTo(hoverState.x, 0);
+      context.lineTo(hoverState.x, cssHeight);
+      context.stroke();
+    }
+  }, [
+    barWidth,
+    contentSpanSec,
+    contentWidth,
+    cssHeight,
+    currentTimeSec,
+    durationSec,
+    hoverState,
+    isWindowed,
+    palette,
+    points,
+    view.amplitude
+  ]);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+
+    if (!viewport) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastManualScrollAtRef.current < 1200) {
+      return;
+    }
+
+    const progressRatio = isWindowed
+      ? Math.max(0, Math.min(1, (currentTimeSec - windowStartSec) / contentSpanSec))
+      : durationSec > 0
+        ? Math.max(0, Math.min(1, currentTimeSec / durationSec))
+        : 0;
+    const progressX = contentWidth * progressRatio;
+    const visibleStart = viewport.scrollLeft;
+    const visibleEnd = visibleStart + viewport.clientWidth;
+    const leftThreshold = visibleStart + viewport.clientWidth * 0.2;
+    const rightThreshold = visibleEnd - viewport.clientWidth * 0.2;
+
+    if (progressX < leftThreshold || progressX > rightThreshold) {
+      const centered = Math.max(
+        0,
+        Math.min(contentWidth - viewport.clientWidth, progressX - viewport.clientWidth * 0.35)
+      );
+      lastAutoScrollAtRef.current = Date.now();
+      viewport.scrollTo({ left: centered, behavior: "smooth" });
+    }
+  }, [contentSpanSec, contentWidth, currentTimeSec, durationSec, isWindowed, windowStartSec]);
+
+  const resolveTimeFromViewportEvent = (clientX: number) => {
+    const viewport = viewportRef.current;
+
+    if (!viewport) {
+      return 0;
+    }
+
+    const rect = viewport.getBoundingClientRect();
+    const x = viewport.scrollLeft + (clientX - rect.left);
+    const ratio = Math.max(0, Math.min(1, x / Math.max(contentWidth, 1)));
+
+    if (isWindowed) {
+      return windowStartSec + ratio * contentSpanSec;
+    }
+
+    return ratio * durationSec;
+  };
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="waveform-canvas"
-      onClick={(event) => {
-        const rect = event.currentTarget.getBoundingClientRect();
-        const ratio = (event.clientX - rect.left) / rect.width;
-        const clickWindowSpanSec = Math.max(0.001, windowEndSec - windowStartSec);
-        const clickIsWindowed = clickWindowSpanSec < Math.max(durationSec - 0.001, 0.001);
-        const timeSec = clickIsWindowed
-          ? windowStartSec + ratio * clickWindowSpanSec
-          : ratio * durationSec;
-        onSeek(timeSec);
-      }}
-    />
+    <div className="waveform-shell">
+      <div
+        ref={viewportRef}
+        className="waveform-viewport"
+        onScroll={(event) => {
+          if (Date.now() - lastAutoScrollAtRef.current < 300) {
+            return;
+          }
+
+          if (!event.currentTarget.matches(":hover")) {
+            return;
+          }
+
+          lastManualScrollAtRef.current = Date.now();
+        }}
+        onPointerMove={(event) => {
+          const viewport = viewportRef.current;
+
+          if (!viewport) {
+            return;
+          }
+
+          const rect = viewport.getBoundingClientRect();
+          const localX = Math.max(0, Math.min(rect.width, event.clientX - rect.left));
+          const timeSec = resolveTimeFromViewportEvent(event.clientX);
+          setHoverState({ x: viewport.scrollLeft + localX, timeSec });
+          onHoverTimeChange?.(timeSec);
+        }}
+        onPointerLeave={() => {
+          setHoverState(null);
+          onHoverTimeChange?.(null);
+        }}
+        onClick={(event) => {
+          onSeek(resolveTimeFromViewportEvent(event.clientX));
+        }}
+      >
+        <canvas ref={canvasRef} className="waveform-canvas" />
+      </div>
+      {hoverState ? (
+        <div
+          className="waveform-hover-tag"
+          style={{
+            left: Math.max(14, Math.min((hoverState.x - (viewportRef.current?.scrollLeft ?? 0)) + 14, (viewportRef.current?.clientWidth ?? 0) - 72))
+          }}
+        >
+          {formatHoverTime(hoverState.timeSec)}
+        </div>
+      ) : null}
+    </div>
   );
 }

@@ -110,6 +110,7 @@ impl Default for PlaybackRuntimeState {
 struct PlaybackSession {
     path: String,
     gain: f32,
+    playback_rate: f32,
     eq: EqSettings,
     stream: OutputStream,
     sink: Sink,
@@ -138,6 +139,10 @@ enum PlaybackCommand {
     },
     SetGain {
         gain: f32,
+        reply: Sender<Result<(), String>>,
+    },
+    SetPlaybackRate {
+        rate: f32,
         reply: Sender<Result<(), String>>,
     },
     SetEq {
@@ -748,6 +753,7 @@ fn eq_band_gain(db: f32) -> f32 {
 fn create_playback_session(
     path: &str,
     gain: f32,
+    playback_rate: f32,
     eq: EqSettings,
     start_at: Duration,
     should_play: bool,
@@ -759,6 +765,7 @@ fn create_playback_session(
     ))
     .map_err(|error| error.to_string())?
     .skip_duration(start_at)
+    .speed(playback_rate.max(0.25))
     .low_pass(220)
     .amplify(eq_band_gain(eq.low));
     let mid = RodioDecoder::try_from(BufReader::new(
@@ -766,6 +773,7 @@ fn create_playback_session(
     ))
     .map_err(|error| error.to_string())?
     .skip_duration(start_at)
+    .speed(playback_rate.max(0.25))
     .high_pass(220)
     .low_pass(4_000)
     .amplify(eq_band_gain(eq.mid));
@@ -774,6 +782,7 @@ fn create_playback_session(
     ))
     .map_err(|error| error.to_string())?
     .skip_duration(start_at)
+    .speed(playback_rate.max(0.25))
     .high_pass(4_000)
     .amplify(eq_band_gain(eq.high));
 
@@ -787,6 +796,7 @@ fn create_playback_session(
     Ok(PlaybackSession {
         path: path.to_string(),
         gain,
+        playback_rate,
         eq,
         stream,
         sink,
@@ -831,7 +841,7 @@ fn playback_worker(
         match receiver.recv_timeout(Duration::from_millis(200)) {
             Ok(command) => match command {
             PlaybackCommand::Open { path, gain, eq, reply } => {
-                let result = create_playback_session(&path, gain, eq, Duration::ZERO, false).map(|next_session| {
+                let result = create_playback_session(&path, gain, 1.0, eq, Duration::ZERO, false).map(|next_session| {
                     update_runtime_status(&runtime_state, 0.0, false);
                     session = Some(next_session);
                     emit_playback_status(&app, &runtime_state);
@@ -876,15 +886,17 @@ fn playback_worker(
                         (
                             current.path.clone(),
                             current.gain,
+                            current.playback_rate,
                             current.eq.clone(),
                             is_session_playing(current),
                         )
                     })
                     .ok_or_else(|| "No audio loaded for playback.".to_string());
-                let result = snapshot.and_then(|(path, gain, eq, was_playing)| {
+                let result = snapshot.and_then(|(path, gain, playback_rate, eq, was_playing)| {
                     let next_session = create_playback_session(
                         &path,
                         gain,
+                        playback_rate,
                         eq,
                         Duration::from_secs_f64(position_sec.max(0.0)),
                         was_playing,
@@ -916,6 +928,39 @@ fn playback_worker(
                     });
                 let _ = reply.send(result.map(|_| ()));
             }
+            PlaybackCommand::SetPlaybackRate { rate, reply } => {
+                let snapshot = session
+                    .as_ref()
+                    .map(|current| {
+                        (
+                            current.path.clone(),
+                            current.gain,
+                            current.eq.clone(),
+                            current.sink.get_pos(),
+                            is_session_playing(current),
+                        )
+                    })
+                    .ok_or_else(|| "No audio loaded for playback.".to_string());
+                let result = snapshot.and_then(|(path, gain, eq, position, was_playing)| {
+                    let next_session = create_playback_session(
+                        &path,
+                        gain,
+                        rate.max(0.25),
+                        eq,
+                        position,
+                        was_playing,
+                    )?;
+                    update_runtime_status(
+                        &runtime_state,
+                        position.as_secs_f64(),
+                        is_session_playing(&next_session),
+                    );
+                    session = Some(next_session);
+                    emit_playback_status(&app, &runtime_state);
+                    Ok(())
+                });
+                let _ = reply.send(result);
+            }
             PlaybackCommand::SetEq { eq, reply } => {
                 let snapshot = session
                     .as_ref()
@@ -923,14 +968,15 @@ fn playback_worker(
                         (
                             current.path.clone(),
                             current.gain,
+                            current.playback_rate,
                             current.sink.get_pos(),
                             is_session_playing(current),
                         )
                     })
                     .ok_or_else(|| "No audio loaded for playback.".to_string());
-                let result = snapshot.and_then(|(path, gain, position, was_playing)| {
+                let result = snapshot.and_then(|(path, gain, playback_rate, position, was_playing)| {
                     let next_session =
-                        create_playback_session(&path, gain, eq, position, was_playing)?;
+                        create_playback_session(&path, gain, playback_rate, eq, position, was_playing)?;
                     update_runtime_status(
                         &runtime_state,
                         position.as_secs_f64(),
@@ -1034,6 +1080,14 @@ fn seek(position_sec: f64, state: State<'_, Arc<AppState>>) -> Result<(), String
 fn set_gain(gain: f64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     send_playback_command(&state.playback, |reply| PlaybackCommand::SetGain {
         gain: gain as f32,
+        reply,
+    })
+}
+
+#[tauri::command]
+fn set_playback_rate(rate: f64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    send_playback_command(&state.playback, |reply| PlaybackCommand::SetPlaybackRate {
+        rate: rate as f32,
         reply,
     })
 }
@@ -1192,6 +1246,7 @@ fn main() {
             pause,
             seek,
             set_gain,
+            set_playback_rate,
             set_eq,
             get_playback_status,
             request_waveform_overview,

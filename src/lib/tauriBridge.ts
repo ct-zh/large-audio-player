@@ -82,6 +82,11 @@ export const bridge = {
       await window.__TAURI__!.core!.invoke("set_gain", { gain });
     }
   },
+  async setPlaybackRate(rate: number): Promise<void> {
+    if (isTauri()) {
+      await window.__TAURI__!.core!.invoke("set_playback_rate", { rate });
+    }
+  },
   async setEq(eq: EqSettings): Promise<void> {
     if (isTauri()) {
       await window.__TAURI__!.core!.invoke("set_eq", { eq });
