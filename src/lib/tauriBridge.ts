@@ -1,4 +1,5 @@
 import type {
+  DspSettings,
   EqSettings,
   OpenAudioResult,
   PlaybackStatus,
@@ -85,6 +86,11 @@ export const bridge = {
   async setPlaybackRate(rate: number): Promise<void> {
     if (isTauri()) {
       await window.__TAURI__!.core!.invoke("set_playback_rate", { rate });
+    }
+  },
+  async setDspSettings(settings: DspSettings): Promise<void> {
+    if (isTauri()) {
+      await window.__TAURI__!.core!.invoke("set_dsp_settings", { settings });
     }
   },
   async setEq(eq: EqSettings): Promise<void> {

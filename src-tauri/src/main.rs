@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use rodio::{Decoder as RodioDecoder, OutputStream, OutputStreamBuilder, Sink, Source};
 use std::{
     collections::HashMap,
+    f32::consts::PI,
     fs::File,
     io::BufReader,
     path::{Path, PathBuf},
@@ -68,6 +69,56 @@ struct EqSettings {
     high: f32,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum NoiseReductionAmount {
+    Off,
+    Low,
+    Medium,
+}
+
+impl Default for NoiseReductionAmount {
+    fn default() -> Self {
+        Self::Off
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DspSettings {
+    input_gain_db: f32,
+    high_pass_hz: f32,
+    low_pass_hz: f32,
+    footstep_presence_db: f32,
+    speech_presence_db: f32,
+    noise_reduction_amount: NoiseReductionAmount,
+    noise_focus_hz: f32,
+    expander_threshold_db: f32,
+    expander_ratio: f32,
+    expander_attack_ms: f32,
+    expander_release_ms: f32,
+    output_gain_db: f32,
+}
+
+impl Default for DspSettings {
+    fn default() -> Self {
+        Self {
+            input_gain_db: 0.0,
+            high_pass_hz: 70.0,
+            low_pass_hz: 8_000.0,
+            footstep_presence_db: 0.0,
+            speech_presence_db: 0.0,
+            noise_reduction_amount: NoiseReductionAmount::Off,
+            noise_focus_hz: 3_500.0,
+            expander_threshold_db: -42.0,
+            expander_ratio: 1.5,
+            expander_attack_ms: 20.0,
+            expander_release_ms: 240.0,
+            output_gain_db: 0.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WaveformPoint {
@@ -112,6 +163,7 @@ struct PlaybackSession {
     gain: f32,
     playback_rate: f32,
     eq: EqSettings,
+    dsp: DspSettings,
     stream: OutputStream,
     sink: Sink,
 }
@@ -125,6 +177,7 @@ enum PlaybackCommand {
         path: String,
         gain: f32,
         eq: EqSettings,
+        dsp: DspSettings,
         reply: Sender<Result<(), String>>,
     },
     Play {
@@ -143,6 +196,10 @@ enum PlaybackCommand {
     },
     SetPlaybackRate {
         rate: f32,
+        reply: Sender<Result<(), String>>,
+    },
+    SetDspSettings {
+        settings: DspSettings,
         reply: Sender<Result<(), String>>,
     },
     SetEq {
@@ -195,6 +252,314 @@ impl AggregateBin {
 
         self.min = self.min.min(min);
         self.max = self.max.max(max);
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BiquadKind {
+    HighPass,
+    LowPass,
+    Peaking,
+    LowShelf,
+    HighShelf,
+}
+
+#[derive(Clone, Copy)]
+struct BiquadCoefficients {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+}
+
+impl BiquadCoefficients {
+    fn identity() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct BiquadState {
+    x1: f32,
+    x2: f32,
+    y1: f32,
+    y2: f32,
+}
+
+struct BiquadFilter {
+    coeffs: BiquadCoefficients,
+    state: BiquadState,
+}
+
+impl BiquadFilter {
+    fn new(coeffs: BiquadCoefficients) -> Self {
+        Self {
+            coeffs,
+            state: BiquadState::default(),
+        }
+    }
+
+    fn process(&mut self, sample: f32) -> f32 {
+        let output = self.coeffs.b0 * sample
+            + self.coeffs.b1 * self.state.x1
+            + self.coeffs.b2 * self.state.x2
+            - self.coeffs.a1 * self.state.y1
+            - self.coeffs.a2 * self.state.y2;
+
+        self.state.x2 = self.state.x1;
+        self.state.x1 = sample;
+        self.state.y2 = self.state.y1;
+        self.state.y1 = output;
+
+        output
+    }
+}
+
+fn db_to_gain(db: f32) -> f32 {
+    10.0_f32.powf(db / 20.0)
+}
+
+fn biquad_coefficients(
+    kind: BiquadKind,
+    sample_rate: u32,
+    frequency_hz: f32,
+    q: f32,
+    gain_db: f32,
+) -> BiquadCoefficients {
+    if sample_rate == 0 || frequency_hz <= 0.0 {
+        return BiquadCoefficients::identity();
+    }
+
+    let nyquist = sample_rate as f32 * 0.5;
+    let frequency_hz = frequency_hz.clamp(10.0, (nyquist - 10.0).max(10.0));
+    let q = q.max(0.1);
+    let omega = 2.0 * PI * frequency_hz / sample_rate as f32;
+    let sin_omega = omega.sin();
+    let cos_omega = omega.cos();
+    let alpha = sin_omega / (2.0 * q);
+    let a = 10.0_f32.powf(gain_db / 40.0);
+
+    let (b0, b1, b2, a0, a1, a2) = match kind {
+        BiquadKind::HighPass => (
+            (1.0 + cos_omega) * 0.5,
+            -(1.0 + cos_omega),
+            (1.0 + cos_omega) * 0.5,
+            1.0 + alpha,
+            -2.0 * cos_omega,
+            1.0 - alpha,
+        ),
+        BiquadKind::LowPass => (
+            (1.0 - cos_omega) * 0.5,
+            1.0 - cos_omega,
+            (1.0 - cos_omega) * 0.5,
+            1.0 + alpha,
+            -2.0 * cos_omega,
+            1.0 - alpha,
+        ),
+        BiquadKind::Peaking => (
+            1.0 + alpha * a,
+            -2.0 * cos_omega,
+            1.0 - alpha * a,
+            1.0 + alpha / a,
+            -2.0 * cos_omega,
+            1.0 - alpha / a,
+        ),
+        BiquadKind::LowShelf => {
+            let sqrt_a = a.sqrt();
+            let alpha_s = sin_omega / 2.0 * (2.0_f32).sqrt();
+            (
+                a * ((a + 1.0) - (a - 1.0) * cos_omega + 2.0 * sqrt_a * alpha_s),
+                2.0 * a * ((a - 1.0) - (a + 1.0) * cos_omega),
+                a * ((a + 1.0) - (a - 1.0) * cos_omega - 2.0 * sqrt_a * alpha_s),
+                (a + 1.0) + (a - 1.0) * cos_omega + 2.0 * sqrt_a * alpha_s,
+                -2.0 * ((a - 1.0) + (a + 1.0) * cos_omega),
+                (a + 1.0) + (a - 1.0) * cos_omega - 2.0 * sqrt_a * alpha_s,
+            )
+        }
+        BiquadKind::HighShelf => {
+            let sqrt_a = a.sqrt();
+            let alpha_s = sin_omega / 2.0 * (2.0_f32).sqrt();
+            (
+                a * ((a + 1.0) + (a - 1.0) * cos_omega + 2.0 * sqrt_a * alpha_s),
+                -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_omega),
+                a * ((a + 1.0) + (a - 1.0) * cos_omega - 2.0 * sqrt_a * alpha_s),
+                (a + 1.0) - (a - 1.0) * cos_omega + 2.0 * sqrt_a * alpha_s,
+                2.0 * ((a - 1.0) - (a + 1.0) * cos_omega),
+                (a + 1.0) - (a - 1.0) * cos_omega - 2.0 * sqrt_a * alpha_s,
+            )
+        }
+    };
+
+    BiquadCoefficients {
+        b0: b0 / a0,
+        b1: b1 / a0,
+        b2: b2 / a0,
+        a1: a1 / a0,
+        a2: a2 / a0,
+    }
+}
+
+struct DspProcessor {
+    channel_count: usize,
+    channel_cursor: usize,
+    input_gain: f32,
+    output_gain: f32,
+    high_pass: Vec<BiquadFilter>,
+    low_pass: Vec<BiquadFilter>,
+    footstep_eq: Vec<BiquadFilter>,
+    speech_eq: Vec<BiquadFilter>,
+    legacy_low_eq: Vec<BiquadFilter>,
+    legacy_mid_eq: Vec<BiquadFilter>,
+    legacy_high_eq: Vec<BiquadFilter>,
+    noise_shelf: Vec<BiquadFilter>,
+    envelope: f32,
+    expander_gain: f32,
+    expander_threshold_db: f32,
+    expander_ratio: f32,
+    attack_coeff: f32,
+    release_coeff: f32,
+}
+
+impl DspProcessor {
+    fn new(sample_rate: u32, channels: u16, eq: &EqSettings, dsp: &DspSettings) -> Self {
+        let channel_count = channels.max(1) as usize;
+        let noise_reduction_db = match dsp.noise_reduction_amount {
+            NoiseReductionAmount::Off => 0.0,
+            NoiseReductionAmount::Low => -3.0,
+            NoiseReductionAmount::Medium => -6.0,
+        };
+
+        let attack_ms = dsp.expander_attack_ms.max(1.0);
+        let release_ms = dsp.expander_release_ms.max(1.0);
+        let attack_coeff = (-1.0 / (sample_rate as f32 * attack_ms / 1000.0)).exp();
+        let release_coeff = (-1.0 / (sample_rate as f32 * release_ms / 1000.0)).exp();
+
+        let build_filters = |kind, freq, q, gain_db| {
+            (0..channel_count)
+                .map(|_| BiquadFilter::new(biquad_coefficients(kind, sample_rate, freq, q, gain_db)))
+                .collect::<Vec<_>>()
+        };
+
+        Self {
+            channel_count,
+            channel_cursor: 0,
+            input_gain: db_to_gain(dsp.input_gain_db),
+            output_gain: db_to_gain(dsp.output_gain_db),
+            high_pass: build_filters(BiquadKind::HighPass, dsp.high_pass_hz, 0.707, 0.0),
+            low_pass: build_filters(BiquadKind::LowPass, dsp.low_pass_hz, 0.707, 0.0),
+            footstep_eq: build_filters(BiquadKind::Peaking, 190.0, 0.9, dsp.footstep_presence_db),
+            speech_eq: build_filters(BiquadKind::Peaking, 2500.0, 0.8, dsp.speech_presence_db),
+            legacy_low_eq: build_filters(BiquadKind::LowShelf, 220.0, 0.707, eq.low),
+            legacy_mid_eq: build_filters(BiquadKind::Peaking, 1_200.0, 0.9, eq.mid),
+            legacy_high_eq: build_filters(BiquadKind::HighShelf, 4_000.0, 0.707, eq.high),
+            noise_shelf: build_filters(BiquadKind::HighShelf, dsp.noise_focus_hz, 0.707, noise_reduction_db),
+            envelope: 0.0,
+            expander_gain: 1.0,
+            expander_threshold_db: dsp.expander_threshold_db,
+            expander_ratio: dsp.expander_ratio.max(1.0),
+            attack_coeff,
+            release_coeff,
+        }
+    }
+
+    fn process_sample(&mut self, sample: f32) -> f32 {
+        let channel = self.channel_cursor;
+        let mut processed = sample * self.input_gain;
+        processed = self.high_pass[channel].process(processed);
+        processed = self.low_pass[channel].process(processed);
+        processed = self.footstep_eq[channel].process(processed);
+        processed = self.speech_eq[channel].process(processed);
+        processed = self.legacy_low_eq[channel].process(processed);
+        processed = self.legacy_mid_eq[channel].process(processed);
+        processed = self.legacy_high_eq[channel].process(processed);
+        processed = self.noise_shelf[channel].process(processed);
+
+        let abs_level = processed.abs().max(1.0e-6);
+        let envelope_coeff = if abs_level > self.envelope {
+            self.attack_coeff
+        } else {
+            self.release_coeff
+        };
+        self.envelope =
+            envelope_coeff * self.envelope + (1.0 - envelope_coeff) * abs_level;
+
+        let envelope_db = 20.0 * self.envelope.max(1.0e-6).log10();
+        let target_gain = if envelope_db < self.expander_threshold_db {
+            let gain_db = (self.expander_ratio - 1.0) * (envelope_db - self.expander_threshold_db);
+            db_to_gain(gain_db)
+        } else {
+            1.0
+        };
+
+        let gain_coeff = if target_gain < self.expander_gain {
+            self.attack_coeff
+        } else {
+            self.release_coeff
+        };
+        self.expander_gain =
+            gain_coeff * self.expander_gain + (1.0 - gain_coeff) * target_gain;
+
+        self.channel_cursor = (self.channel_cursor + 1) % self.channel_count;
+        processed * self.expander_gain * self.output_gain
+    }
+}
+
+struct DspSource<S>
+where
+    S: Source<Item = f32>,
+{
+    inner: S,
+    processor: DspProcessor,
+}
+
+impl<S> DspSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn new(inner: S, eq: EqSettings, dsp: DspSettings) -> Self {
+        let processor = DspProcessor::new(inner.sample_rate(), inner.channels(), &eq, &dsp);
+        Self { inner, processor }
+    }
+}
+
+impl<S> Iterator for DspSource<S>
+where
+    S: Source<Item = f32>,
+{
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner
+            .next()
+            .map(|sample| self.processor.process_sample(sample))
+    }
+}
+
+impl<S> Source for DspSource<S>
+where
+    S: Source<Item = f32>,
+{
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+
+    fn channels(&self) -> u16 {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
     }
 }
 
@@ -746,47 +1111,26 @@ fn build_waveform_overview(
     Ok(())
 }
 
-fn eq_band_gain(db: f32) -> f32 {
-    10.0_f32.powf(db / 20.0)
-}
-
 fn create_playback_session(
     path: &str,
     gain: f32,
     playback_rate: f32,
     eq: EqSettings,
+    dsp: DspSettings,
     start_at: Duration,
     should_play: bool,
 ) -> Result<PlaybackSession, String> {
     let stream = OutputStreamBuilder::open_default_stream().map_err(|error| error.to_string())?;
     let sink = Sink::connect_new(stream.mixer());
-    let low = RodioDecoder::try_from(BufReader::new(
+    let decoder = RodioDecoder::try_from(BufReader::new(
         File::open(path).map_err(|error| error.to_string())?,
     ))
     .map_err(|error| error.to_string())?
     .skip_duration(start_at)
-    .speed(playback_rate.max(0.25))
-    .low_pass(220)
-    .amplify(eq_band_gain(eq.low));
-    let mid = RodioDecoder::try_from(BufReader::new(
-        File::open(path).map_err(|error| error.to_string())?,
-    ))
-    .map_err(|error| error.to_string())?
-    .skip_duration(start_at)
-    .speed(playback_rate.max(0.25))
-    .high_pass(220)
-    .low_pass(4_000)
-    .amplify(eq_band_gain(eq.mid));
-    let high = RodioDecoder::try_from(BufReader::new(
-        File::open(path).map_err(|error| error.to_string())?,
-    ))
-    .map_err(|error| error.to_string())?
-    .skip_duration(start_at)
-    .speed(playback_rate.max(0.25))
-    .high_pass(4_000)
-    .amplify(eq_band_gain(eq.high));
+    .speed(playback_rate.max(0.25));
+    let dsp_source = DspSource::new(decoder, eq.clone(), dsp.clone());
 
-    sink.append(low.mix(mid).mix(high));
+    sink.append(dsp_source);
     sink.set_volume(gain.max(0.0));
 
     if !should_play {
@@ -798,6 +1142,7 @@ fn create_playback_session(
         gain,
         playback_rate,
         eq,
+        dsp,
         stream,
         sink,
     })
@@ -840,8 +1185,8 @@ fn playback_worker(
     loop {
         match receiver.recv_timeout(Duration::from_millis(200)) {
             Ok(command) => match command {
-            PlaybackCommand::Open { path, gain, eq, reply } => {
-                let result = create_playback_session(&path, gain, 1.0, eq, Duration::ZERO, false).map(|next_session| {
+            PlaybackCommand::Open { path, gain, eq, dsp, reply } => {
+                let result = create_playback_session(&path, gain, 1.0, eq, dsp, Duration::ZERO, false).map(|next_session| {
                     update_runtime_status(&runtime_state, 0.0, false);
                     session = Some(next_session);
                     emit_playback_status(&app, &runtime_state);
@@ -888,16 +1233,18 @@ fn playback_worker(
                             current.gain,
                             current.playback_rate,
                             current.eq.clone(),
+                            current.dsp.clone(),
                             is_session_playing(current),
                         )
                     })
                     .ok_or_else(|| "No audio loaded for playback.".to_string());
-                let result = snapshot.and_then(|(path, gain, playback_rate, eq, was_playing)| {
+                let result = snapshot.and_then(|(path, gain, playback_rate, eq, dsp, was_playing)| {
                     let next_session = create_playback_session(
                         &path,
                         gain,
                         playback_rate,
                         eq,
+                        dsp,
                         Duration::from_secs_f64(position_sec.max(0.0)),
                         was_playing,
                     )?;
@@ -936,17 +1283,54 @@ fn playback_worker(
                             current.path.clone(),
                             current.gain,
                             current.eq.clone(),
+                            current.dsp.clone(),
                             current.sink.get_pos(),
                             is_session_playing(current),
                         )
                     })
                     .ok_or_else(|| "No audio loaded for playback.".to_string());
-                let result = snapshot.and_then(|(path, gain, eq, position, was_playing)| {
+                let result = snapshot.and_then(|(path, gain, eq, dsp, position, was_playing)| {
                     let next_session = create_playback_session(
                         &path,
                         gain,
                         rate.max(0.25),
                         eq,
+                        dsp,
+                        position,
+                        was_playing,
+                    )?;
+                    update_runtime_status(
+                        &runtime_state,
+                        position.as_secs_f64(),
+                        is_session_playing(&next_session),
+                    );
+                    session = Some(next_session);
+                    emit_playback_status(&app, &runtime_state);
+                    Ok(())
+                });
+                let _ = reply.send(result);
+            }
+            PlaybackCommand::SetDspSettings { settings, reply } => {
+                let snapshot = session
+                    .as_ref()
+                    .map(|current| {
+                        (
+                            current.path.clone(),
+                            current.gain,
+                            current.playback_rate,
+                            current.eq.clone(),
+                            current.sink.get_pos(),
+                            is_session_playing(current),
+                        )
+                    })
+                    .ok_or_else(|| "No audio loaded for playback.".to_string());
+                let result = snapshot.and_then(|(path, gain, playback_rate, eq, position, was_playing)| {
+                    let next_session = create_playback_session(
+                        &path,
+                        gain,
+                        playback_rate,
+                        eq,
+                        settings,
                         position,
                         was_playing,
                     )?;
@@ -969,14 +1353,15 @@ fn playback_worker(
                             current.path.clone(),
                             current.gain,
                             current.playback_rate,
+                            current.dsp.clone(),
                             current.sink.get_pos(),
                             is_session_playing(current),
                         )
                     })
                     .ok_or_else(|| "No audio loaded for playback.".to_string());
-                let result = snapshot.and_then(|(path, gain, playback_rate, position, was_playing)| {
+                let result = snapshot.and_then(|(path, gain, playback_rate, dsp, position, was_playing)| {
                     let next_session =
-                        create_playback_session(&path, gain, playback_rate, eq, position, was_playing)?;
+                        create_playback_session(&path, gain, playback_rate, eq, dsp, position, was_playing)?;
                     update_runtime_status(
                         &runtime_state,
                         position.as_secs_f64(),
@@ -1050,6 +1435,7 @@ fn open_audio(path: String, state: State<'_, Arc<AppState>>) -> Result<OpenAudio
         path: audio_meta.path.clone(),
         gain: 1.0,
         eq: EqSettings::default(),
+        dsp: DspSettings::default(),
         reply,
     })?;
 
@@ -1088,6 +1474,14 @@ fn set_gain(gain: f64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
 fn set_playback_rate(rate: f64, state: State<'_, Arc<AppState>>) -> Result<(), String> {
     send_playback_command(&state.playback, |reply| PlaybackCommand::SetPlaybackRate {
         rate: rate as f32,
+        reply,
+    })
+}
+
+#[tauri::command]
+fn set_dsp_settings(settings: DspSettings, state: State<'_, Arc<AppState>>) -> Result<(), String> {
+    send_playback_command(&state.playback, |reply| PlaybackCommand::SetDspSettings {
+        settings,
         reply,
     })
 }
@@ -1247,6 +1641,7 @@ fn main() {
             seek,
             set_gain,
             set_playback_rate,
+            set_dsp_settings,
             set_eq,
             get_playback_status,
             request_waveform_overview,

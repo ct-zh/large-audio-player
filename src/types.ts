@@ -19,6 +19,31 @@ export interface EqSettings {
   high: number;
 }
 
+export type NoiseReductionAmount =
+  | "off"
+  | "low"
+  | "medium";
+
+export type DspPresetId =
+  | "off"
+  | "upstairs_voice_footsteps"
+  | "custom";
+
+export interface DspSettings {
+  inputGainDb: number;
+  highPassHz: number;
+  lowPassHz: number;
+  footstepPresenceDb: number;
+  speechPresenceDb: number;
+  noiseReductionAmount: NoiseReductionAmount;
+  noiseFocusHz: number;
+  expanderThresholdDb: number;
+  expanderRatio: number;
+  expanderAttackMs: number;
+  expanderReleaseMs: number;
+  outputGainDb: number;
+}
+
 export interface WaveformView {
   zoom: number;
   amplitude: number;
@@ -47,6 +72,9 @@ export interface PlayerState {
   gain: number;
   playbackRate: number;
   eq: EqSettings;
+  dspPresetId: DspPresetId;
+  dsp: DspSettings;
+  isAdvancedDspOpen: boolean;
   currentTimeSec: number;
   durationSec: number;
   isPlaying: boolean;

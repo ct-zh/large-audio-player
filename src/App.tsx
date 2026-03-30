@@ -3,7 +3,10 @@ import { bridge } from "./lib/tauriBridge";
 import { WaveformCanvas } from "./components/WaveformCanvas";
 import type {
   AudioMeta,
+  DspPresetId,
+  DspSettings,
   EqSettings,
+  NoiseReductionAmount,
   PlayerState,
   WaveformOverviewPayload,
   WaveformView
@@ -16,6 +19,41 @@ const defaultWaveformView: WaveformView = {
   colorScheme: "ocean"
 };
 
+const offDspPreset: DspSettings = {
+  inputGainDb: 0,
+  highPassHz: 70,
+  lowPassHz: 8_000,
+  footstepPresenceDb: 0,
+  speechPresenceDb: 0,
+  noiseReductionAmount: "off",
+  noiseFocusHz: 3_500,
+  expanderThresholdDb: -42,
+  expanderRatio: 1.5,
+  expanderAttackMs: 20,
+  expanderReleaseMs: 240,
+  outputGainDb: 0
+};
+
+const upstairsVoiceFootstepsPreset: DspSettings = {
+  inputGainDb: 0,
+  highPassHz: 70,
+  lowPassHz: 8_000,
+  footstepPresenceDb: 4,
+  speechPresenceDb: 3,
+  noiseReductionAmount: "low",
+  noiseFocusHz: 3_500,
+  expanderThresholdDb: -42,
+  expanderRatio: 1.5,
+  expanderAttackMs: 20,
+  expanderReleaseMs: 240,
+  outputGainDb: 1
+};
+
+const dspPresets: Record<Exclude<DspPresetId, "custom">, DspSettings> = {
+  off: offDspPreset,
+  upstairs_voice_footsteps: upstairsVoiceFootstepsPreset
+};
+
 const initialState: PlayerState = {
   phase: "idle",
   errorMessage: null,
@@ -25,6 +63,9 @@ const initialState: PlayerState = {
   gain: 1,
   playbackRate: 1,
   eq: defaultEq,
+  dspPresetId: "off",
+  dsp: offDspPreset,
+  isAdvancedDspOpen: false,
   currentTimeSec: 0,
   durationSec: 0,
   isPlaying: false,
@@ -82,6 +123,35 @@ const contentByLocale = {
     pause: "暂停",
     restart: "从头播放",
     speed: "倍速",
+    dspPresetTitle: "处理预设",
+    dspPresetDescription: "选择保守的监听处理方案。",
+    dspPresetOff: "关闭",
+    dspPresetUpstairs: "楼上脚步声 / 说话声录音",
+    dspPresetCustom: "自定义",
+    dspBasicTitle: "基础处理",
+    dspBasicDescription: "控制高通、低通、目标增强和轻度抑噪。",
+    dspAdvancedTitle: "高级处理",
+    dspAdvancedDescription: "扩展器与噪声重点频率。",
+    inputGain: "输入增益",
+    highPass: "高通",
+    lowPass: "低通",
+    footstepPresence: "动作声增强",
+    speechPresence: "人声增强",
+    noiseReduction: "底噪抑制",
+    noiseFocus: "噪声重点频率",
+    outputGain: "输出增益",
+    expanderThreshold: "扩展器阈值",
+    expanderRatio: "扩展器比率",
+    expanderAttack: "扩展器起效",
+    expanderRelease: "扩展器释放",
+    noiseReductionOff: "关闭",
+    noiseReductionLow: "低",
+    noiseReductionMedium: "中",
+    applyDsp: "应用",
+    resetDspDraft: "恢复已应用",
+    pendingDsp: "参数未应用",
+    showAdvanced: "显示高级参数",
+    hideAdvanced: "收起高级参数",
     progressLabel: "播放进度",
     hoverTime: "悬停时间",
     metadataHz: "Hz",
@@ -138,6 +208,35 @@ const contentByLocale = {
     pause: "Pause",
     restart: "Restart",
     speed: "Speed",
+    dspPresetTitle: "Processing Preset",
+    dspPresetDescription: "Choose a conservative monitoring profile.",
+    dspPresetOff: "Off",
+    dspPresetUpstairs: "Upstairs footsteps / speech",
+    dspPresetCustom: "Custom",
+    dspBasicTitle: "Basic Processing",
+    dspBasicDescription: "Control filters, target boosts, and gentle noise reduction.",
+    dspAdvancedTitle: "Advanced Processing",
+    dspAdvancedDescription: "Expander tuning and noise focus frequency.",
+    inputGain: "Input Gain",
+    highPass: "High-pass",
+    lowPass: "Low-pass",
+    footstepPresence: "Footstep Boost",
+    speechPresence: "Speech Boost",
+    noiseReduction: "Noise Reduction",
+    noiseFocus: "Noise Focus",
+    outputGain: "Output Gain",
+    expanderThreshold: "Expander Threshold",
+    expanderRatio: "Expander Ratio",
+    expanderAttack: "Expander Attack",
+    expanderRelease: "Expander Release",
+    noiseReductionOff: "Off",
+    noiseReductionLow: "Low",
+    noiseReductionMedium: "Medium",
+    applyDsp: "Apply",
+    resetDspDraft: "Reset to applied",
+    pendingDsp: "Pending changes",
+    showAdvanced: "Show advanced controls",
+    hideAdvanced: "Hide advanced controls",
     progressLabel: "Playback progress",
     hoverTime: "Hover time",
     metadataHz: "Hz",
@@ -175,6 +274,34 @@ const getDesktopFilePath = (file: File) => {
   return typeof desktopPath === "string" && desktopPath.length > 0 ? desktopPath : null;
 };
 
+const cloneDspSettings = (settings: DspSettings): DspSettings => ({ ...settings });
+
+const sameDspSettings = (left: DspSettings, right: DspSettings) =>
+  left.inputGainDb === right.inputGainDb &&
+  left.highPassHz === right.highPassHz &&
+  left.lowPassHz === right.lowPassHz &&
+  left.footstepPresenceDb === right.footstepPresenceDb &&
+  left.speechPresenceDb === right.speechPresenceDb &&
+  left.noiseReductionAmount === right.noiseReductionAmount &&
+  left.noiseFocusHz === right.noiseFocusHz &&
+  left.expanderThresholdDb === right.expanderThresholdDb &&
+  left.expanderRatio === right.expanderRatio &&
+  left.expanderAttackMs === right.expanderAttackMs &&
+  left.expanderReleaseMs === right.expanderReleaseMs &&
+  left.outputGainDb === right.outputGainDb;
+
+const detectPresetId = (settings: DspSettings): DspPresetId => {
+  if (sameDspSettings(settings, dspPresets.off)) {
+    return "off";
+  }
+
+  if (sameDspSettings(settings, dspPresets.upstairs_voice_footsteps)) {
+    return "upstairs_voice_footsteps";
+  }
+
+  return "custom";
+};
+
 const waveformTargetPoints = (zoom: number) => {
   if (zoom >= 5) {
     return 2880;
@@ -207,6 +334,7 @@ const waveformWindowForView = (durationSec: number, currentTimeSec: number, zoom
 
 function App() {
   const [state, setState] = useState<PlayerState>(initialState);
+  const [draftDsp, setDraftDsp] = useState<DspSettings>(cloneDspSettings(initialState.dsp));
   const [view, setView] = useState<WaveformView>(defaultWaveformView);
   const [locale, setLocale] = useState<Locale>("zh-CN");
   const [isDragging, setIsDragging] = useState(false);
@@ -217,6 +345,8 @@ function App() {
   const openRequestIdRef = useRef(0);
   const currentMeta = state.audioMeta;
   const copy = contentByLocale[locale];
+  const draftDspPresetId = detectPresetId(draftDsp);
+  const dspDirty = !sameDspSettings(draftDsp, state.dsp);
 
   useEffect(() => {
     let unlistenProgress: () => void = () => {};
@@ -357,6 +487,25 @@ function App() {
     { value: "mono" as const, label: copy.paletteMono }
   ];
   const playbackRateOptions = [0.5, 1, 1.25, 1.5, 2];
+  const dspPresetOptions: Array<{ value: Exclude<DspPresetId, "custom"> | "custom"; label: string }> = [
+    { value: "off", label: copy.dspPresetOff },
+    { value: "upstairs_voice_footsteps", label: copy.dspPresetUpstairs },
+    { value: "custom", label: copy.dspPresetCustom }
+  ];
+  const noiseReductionOptions: Array<{ value: NoiseReductionAmount; label: string }> = [
+    { value: "off", label: copy.noiseReductionOff },
+    { value: "low", label: copy.noiseReductionLow },
+    { value: "medium", label: copy.noiseReductionMedium }
+  ];
+
+  const applyFallbackDspToAudio = (settings: DspSettings) => {
+    if (isDesktopTauri || !audioRef.current) {
+      return;
+    }
+
+    const linearOutput = 10 ** (settings.outputGainDb / 20);
+    audioRef.current.volume = Math.max(0, Math.min(1, linearOutput));
+  };
 
   const resetPlaybackSideEffects = async () => {
     if (!isDesktopTauri && audioRef.current) {
@@ -393,6 +542,7 @@ function App() {
     audioRef.current.src = nextUrl;
     audioRef.current.load();
     audioRef.current.playbackRate = initialState.playbackRate;
+    applyFallbackDspToAudio(initialState.dsp);
 
     setState((prev) => ({
       ...prev,
@@ -428,6 +578,7 @@ function App() {
       ...initialState,
       phase: "loading"
     });
+    setDraftDsp(cloneDspSettings(initialState.dsp));
 
     try {
       const { audioMeta } = await bridge.openAudio(source.path, source.file);
@@ -577,13 +728,34 @@ function App() {
     await bridge.setEq(eq);
   };
 
-  const updateGain = async (gain: number) => {
-    setState((prev) => ({ ...prev, gain }));
-    await bridge.setGain(gain);
+  const applyDspSettings = async (nextSettings: DspSettings) => {
+    const nextPresetId = detectPresetId(nextSettings);
+    setState((prev) => ({
+      ...prev,
+      dsp: nextSettings,
+      dspPresetId: nextPresetId,
+      gain: 10 ** (nextSettings.outputGainDb / 20)
+    }));
+    applyFallbackDspToAudio(nextSettings);
 
-    if (!isDesktopTauri && audioRef.current) {
-      audioRef.current.volume = Math.max(0, Math.min(1, gain));
+    if (currentMeta) {
+      await bridge.setDspSettings(nextSettings);
     }
+  };
+
+  const updateDspField = <K extends keyof DspSettings>(key: K, value: DspSettings[K]) => {
+    setDraftDsp((prev) => ({
+      ...prev,
+      [key]: value
+    }));
+  };
+
+  const applyDspPreset = (presetId: Exclude<DspPresetId, "custom">) => {
+    setDraftDsp(cloneDspSettings(dspPresets[presetId]));
+  };
+
+  const resetDspDraft = () => {
+    setDraftDsp(cloneDspSettings(state.dsp));
   };
 
   const updatePlaybackRate = async (playbackRate: number) => {
@@ -689,23 +861,252 @@ function App() {
           <section className="panel-card">
             <div className="panel-heading">
               <div>
+                <p className="eyebrow">{copy.dspPresetTitle}</p>
+                <h2>{copy.dspPresetDescription}</h2>
+              </div>
+            </div>
+            <div className="preset-pills">
+              {dspPresetOptions.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  className={`preset-pill ${draftDspPresetId === option.value ? "active" : ""}`}
+                  onClick={() => {
+                    if (option.value !== "custom") {
+                      applyDspPreset(option.value);
+                    }
+                  }}
+                  disabled={option.value === "custom"}
+                >
+                  {option.label}
+                </button>
+              ))}
+            </div>
+            <div className="dsp-actions">
+              <button
+                type="button"
+                className="candy-button compact-button"
+                disabled={!dspDirty}
+                onClick={() => {
+                  void applyDspSettings(draftDsp);
+                }}
+              >
+                {copy.applyDsp}
+              </button>
+              <button
+                type="button"
+                className="ghost-button compact-button"
+                disabled={!dspDirty}
+                onClick={resetDspDraft}
+              >
+                {copy.resetDspDraft}
+              </button>
+            </div>
+            {dspDirty ? <p className="micro-copy pending-indicator">{copy.pendingDsp}</p> : null}
+          </section>
+
+          <section className="panel-card">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">{copy.dspBasicTitle}</p>
+                <h2>{copy.dspBasicDescription}</h2>
+              </div>
+            </div>
+            <label className="slider-field">
+              <span>{copy.inputGain} {draftDsp.inputGainDb.toFixed(1)} dB</span>
+              <input
+                type="range"
+                min="-12"
+                max="12"
+                step="0.5"
+                value={draftDsp.inputGainDb}
+                onChange={(event) => {
+                  updateDspField("inputGainDb", Number(event.target.value));
+                }}
+              />
+            </label>
+            <label className="slider-field">
+              <span>{copy.highPass} {Math.round(draftDsp.highPassHz)} Hz</span>
+              <input
+                type="range"
+                min="30"
+                max="150"
+                step="1"
+                value={draftDsp.highPassHz}
+                onChange={(event) => {
+                  updateDspField("highPassHz", Number(event.target.value));
+                }}
+              />
+            </label>
+            <label className="slider-field">
+              <span>{copy.lowPass} {Math.round(draftDsp.lowPassHz)} Hz</span>
+              <input
+                type="range"
+                min="4000"
+                max="12000"
+                step="100"
+                value={draftDsp.lowPassHz}
+                onChange={(event) => {
+                  updateDspField("lowPassHz", Number(event.target.value));
+                }}
+              />
+            </label>
+            <label className="slider-field">
+              <span>{copy.footstepPresence} {draftDsp.footstepPresenceDb.toFixed(1)} dB</span>
+              <input
+                type="range"
+                min="-6"
+                max="9"
+                step="0.5"
+                value={draftDsp.footstepPresenceDb}
+                onChange={(event) => {
+                  updateDspField("footstepPresenceDb", Number(event.target.value));
+                }}
+              />
+            </label>
+            <label className="slider-field">
+              <span>{copy.speechPresence} {draftDsp.speechPresenceDb.toFixed(1)} dB</span>
+              <input
+                type="range"
+                min="-6"
+                max="9"
+                step="0.5"
+                value={draftDsp.speechPresenceDb}
+                onChange={(event) => {
+                  updateDspField("speechPresenceDb", Number(event.target.value));
+                }}
+              />
+            </label>
+            <label className="select-field">
+              <span>{copy.noiseReduction}</span>
+              <select
+                value={draftDsp.noiseReductionAmount}
+                onChange={(event) => {
+                  updateDspField(
+                    "noiseReductionAmount",
+                    event.target.value as NoiseReductionAmount
+                  );
+                }}
+              >
+                {noiseReductionOptions.map((option) => (
+                  <option key={option.value} value={option.value}>
+                    {option.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <label className="slider-field">
+              <span>{copy.outputGain} {draftDsp.outputGainDb.toFixed(1)} dB</span>
+              <input
+                type="range"
+                min="-12"
+                max="12"
+                step="0.5"
+                value={draftDsp.outputGainDb}
+                onChange={(event) => {
+                  updateDspField("outputGainDb", Number(event.target.value));
+                }}
+              />
+            </label>
+          </section>
+
+          <section className="panel-card">
+            <div className="panel-heading">
+              <div>
+                <p className="eyebrow">{copy.dspAdvancedTitle}</p>
+                <h2>{copy.dspAdvancedDescription}</h2>
+              </div>
+              <button
+                type="button"
+                className="ghost-button compact-button"
+                onClick={() => {
+                  setState((prev) => ({
+                    ...prev,
+                    isAdvancedDspOpen: !prev.isAdvancedDspOpen
+                  }));
+                }}
+              >
+                {state.isAdvancedDspOpen ? copy.hideAdvanced : copy.showAdvanced}
+              </button>
+            </div>
+            {state.isAdvancedDspOpen ? (
+              <>
+                <label className="slider-field">
+                  <span>{copy.noiseFocus} {Math.round(draftDsp.noiseFocusHz)} Hz</span>
+                  <input
+                    type="range"
+                    min="2000"
+                    max="8000"
+                    step="100"
+                    value={draftDsp.noiseFocusHz}
+                    onChange={(event) => {
+                      updateDspField("noiseFocusHz", Number(event.target.value));
+                    }}
+                  />
+                </label>
+                <label className="slider-field">
+                  <span>{copy.expanderThreshold} {draftDsp.expanderThresholdDb.toFixed(1)} dB</span>
+                  <input
+                    type="range"
+                    min="-60"
+                    max="-25"
+                    step="0.5"
+                    value={draftDsp.expanderThresholdDb}
+                    onChange={(event) => {
+                      updateDspField("expanderThresholdDb", Number(event.target.value));
+                    }}
+                  />
+                </label>
+                <label className="slider-field">
+                  <span>{copy.expanderRatio} {draftDsp.expanderRatio.toFixed(2)}</span>
+                  <input
+                    type="range"
+                    min="1"
+                    max="3"
+                    step="0.05"
+                    value={draftDsp.expanderRatio}
+                    onChange={(event) => {
+                      updateDspField("expanderRatio", Number(event.target.value));
+                    }}
+                  />
+                </label>
+                <label className="slider-field">
+                  <span>{copy.expanderAttack} {Math.round(draftDsp.expanderAttackMs)} ms</span>
+                  <input
+                    type="range"
+                    min="5"
+                    max="80"
+                    step="1"
+                    value={draftDsp.expanderAttackMs}
+                    onChange={(event) => {
+                      updateDspField("expanderAttackMs", Number(event.target.value));
+                    }}
+                  />
+                </label>
+                <label className="slider-field">
+                  <span>{copy.expanderRelease} {Math.round(draftDsp.expanderReleaseMs)} ms</span>
+                  <input
+                    type="range"
+                    min="80"
+                    max="600"
+                    step="5"
+                    value={draftDsp.expanderReleaseMs}
+                    onChange={(event) => {
+                      updateDspField("expanderReleaseMs", Number(event.target.value));
+                    }}
+                  />
+                </label>
+              </>
+            ) : null}
+          </section>
+
+          <section className="panel-card">
+            <div className="panel-heading">
+              <div>
                 <p className="eyebrow">{copy.chainPanelTitle}</p>
                 <h2>{copy.chainPanelDescription}</h2>
               </div>
             </div>
-            <label className="slider-field">
-              <span>{copy.gain} {state.gain.toFixed(2)}</span>
-              <input
-                type="range"
-                min="0"
-                max="2"
-                step="0.01"
-                value={state.gain}
-                onChange={(event) => {
-                  void updateGain(Number(event.target.value));
-                }}
-              />
-            </label>
             <label className="slider-field">
               <span>{copy.low} {state.eq.low.toFixed(1)} dB</span>
               <input
