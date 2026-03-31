@@ -51,7 +51,7 @@ body,
 
 body {
   margin: 0;
-  min-width: 1180px;
+  min-width: 0;
   color: var(--text-main);
 }
 
@@ -67,7 +67,7 @@ button {
 
 .app-shell {
   display: grid;
-  grid-template-columns: minmax(360px, 430px) minmax(700px, 1fr);
+  grid-template-columns: minmax(320px, 430px) minmax(0, 1fr);
   height: 100vh;
   overflow: hidden;
   padding: 22px;
@@ -385,6 +385,8 @@ select {
 .player-stage-shell {
   position: relative;
   height: 100%;
+  min-width: 0;
+  min-height: 0;
   border-radius: 36px;
   border: 1px solid var(--border-soft);
   background:
@@ -447,6 +449,7 @@ select {
   justify-content: space-between;
   align-items: flex-start;
   gap: 16px;
+  min-width: 0;
 }
 
 .player-stage-header h2 {
@@ -455,8 +458,14 @@ select {
   letter-spacing: -0.04em;
 }
 
+.player-stage-header > div {
+  min-width: 0;
+}
+
 .player-stage-header .supporting-copy {
   max-width: 320px;
+  min-width: 0;
+  overflow-wrap: anywhere;
   text-align: right;
 }
 
@@ -464,6 +473,10 @@ select {
   display: grid;
   gap: 18px;
   min-height: 0;
+  min-width: 0;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-right: 4px;
 }
 
 .track-banner {
@@ -471,15 +484,21 @@ select {
   justify-content: space-between;
   align-items: flex-start;
   gap: 18px;
+  min-width: 0;
   padding: 18px 20px;
   border-radius: 28px;
   background: rgba(255, 255, 255, 0.78);
   border: 1px solid rgba(218, 205, 232, 0.9);
 }
 
+.track-banner > div {
+  min-width: 0;
+}
+
 .track-banner h3 {
   font-size: 1.9rem;
   line-height: 1.08;
+  min-width: 0;
   max-width: 680px;
   overflow-wrap: anywhere;
 }
@@ -524,6 +543,7 @@ select {
   gap: 18px;
   padding: 20px;
   min-height: 0;
+  min-width: 0;
   border-radius: 30px;
   border: 1px solid rgba(214, 201, 229, 0.9);
   background:
@@ -533,9 +553,14 @@ select {
 
 .waveform-shell {
   position: relative;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .waveform-viewport {
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
   overflow-x: auto;
   overflow-y: hidden;
   border-radius: 22px;
@@ -561,6 +586,7 @@ select {
 
 .waveform-canvas {
   height: 390px;
+  max-width: none;
   display: block;
   background: transparent;
 }
@@ -582,9 +608,10 @@ select {
 
 .transport {
   display: grid;
-  grid-template-columns: auto auto minmax(220px, auto) minmax(0, 1fr) auto;
+  grid-template-columns: auto auto minmax(0, 1fr);
   align-items: end;
   gap: 14px;
+  min-width: 0;
 }
 
 .transport-button {
@@ -596,12 +623,15 @@ select {
   gap: 8px;
   color: var(--text-soft);
   min-width: 0;
+  grid-column: 1 / -1;
 }
 
 .speed-control {
   display: grid;
   gap: 8px;
   color: var(--text-soft);
+  min-width: 0;
+  grid-column: 1 / -1;
 }
 
 .speed-control > span {
@@ -612,9 +642,12 @@ select {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+  width: 100%;
+  min-width: 0;
 }
 
 .speed-pill {
+  flex: 0 1 auto;
   border: 1px solid rgba(213, 198, 229, 0.95);
   border-radius: 999px;
   padding: 8px 12px;
@@ -639,18 +672,22 @@ select {
 
 .seek-bar {
   width: 100%;
+  min-width: 0;
 }
 
 .transport-meta {
   display: grid;
   gap: 6px;
   align-self: center;
+  min-width: 0;
+  grid-column: 1 / -1;
 }
 
 .transport-time,
 .hover-time {
   color: var(--text-main);
   font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
 }
 
 .empty-stage-card {
@@ -684,17 +721,48 @@ select {
   backdrop-filter: blur(10px);
 }
 
+@media (max-width: 1480px) {
+  .app-shell {
+    grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+    padding: 16px;
+    gap: 16px;
+  }
+
+  .player-stage-shell {
+    padding: 22px;
+  }
+
+  .player-stage-header,
+  .track-banner {
+    display: grid;
+    grid-template-columns: 1fr;
+  }
+
+  .player-stage-header .supporting-copy {
+    max-width: none;
+    text-align: left;
+  }
+
+  .track-banner h3 {
+    max-width: 100%;
+  }
+
+  .stat-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .waveform-canvas {
+    height: clamp(260px, 32vh, 360px);
+  }
+}
+
 @media (max-width: 1280px) {
   body {
     min-width: 0;
   }
 
   .app-shell {
-    grid-template-columns: 360px minmax(0, 1fr);
-  }
-
-  .stat-grid {
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-template-columns: minmax(260px, 320px) minmax(0, 1fr);
   }
 
   .transport {
@@ -708,6 +776,10 @@ select {
 
   .transport-meta {
     grid-column: 1 / -1;
+  }
+
+  .waveform-canvas {
+    height: clamp(240px, 30vh, 320px);
   }
 }
 
@@ -740,6 +812,10 @@ select {
   .player-stage-header .supporting-copy {
     max-width: none;
     text-align: left;
+  }
+
+  .waveform-canvas {
+    height: clamp(220px, 34vh, 300px);
   }
 }
 
