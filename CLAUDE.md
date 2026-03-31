@@ -17,7 +17,12 @@ npx tauri build                  # Build production desktop app
 
 Pre-commit validation: `npx tsc --noEmit` + `npm run build` + `cd src-tauri && cargo check`.
 
-No formal test suite — verify audio changes manually with local wav/mp3 files (file open, playback, seek, EQ, zoom, waveform).
+No formal test suite — verify audio changes manually with local wav/mp3 files:
+- file open / drag-drop / system dialog
+- playback / pause / restart / keyboard seek
+- speed switching
+- waveform hover / horizontal scroll / zoom
+- EQ and DSP preset / parameter apply flow
 
 ## Architecture
 
@@ -25,8 +30,8 @@ Tauri 2 desktop app: **React frontend** communicates with **Rust backend** via T
 
 ### Frontend (`src/`)
 
-- `App.tsx` — Main player UI, state management, waveform request policy
-- `components/WaveformCanvas.tsx` — Canvas-based waveform rendering with zoom/seek
+- `App.tsx` — Main bilingual player UI, state management, DSP draft/apply flow, waveform request policy
+- `components/WaveformCanvas.tsx` — Canvas-based waveform rendering with zoom, horizontal scroll, seek, and hover time
 - `lib/tauriBridge.ts` — All backend calls go through here; each method checks `isTauri()` and falls back to mock data in browser
 - `types.ts` — Shared type definitions (AudioMeta, EqSettings, DspSettings, WaveformPoint, PlayerState)
 
@@ -36,7 +41,7 @@ Single-file Rust backend (~1,650 lines) containing:
 
 - **Tauri commands**: `open_audio`, `play`, `pause`, `seek`, `set_gain`, `set_playback_rate`, `set_eq`, `set_dsp_settings`, `request_waveform_overview`, `get_playback_status`, `close_current_audio`
 - **PlaybackController** — Dedicated thread with mpsc command channel, uses `rodio` for audio output
-- **DSP pipeline** — High-pass/low-pass filters, 3-band EQ, expander, noise reduction applied via `Source` trait wrappers
+- **DSP pipeline** — High-pass/low-pass filters, speech/footstep emphasis, legacy 3-band EQ compatibility, expander, and high-frequency noise reduction applied via `Source` trait wrappers
 - **Waveform generation** — Background thread with progress events, uses `symphonia` for audio parsing
 - **Waveform caching** — Two-layer: in-memory HashMap + disk cache with content-hash keys
 
@@ -58,6 +63,15 @@ Tauri events pushed from backend to frontend:
 - **Detail**: Up to 4,096 points for a specific time window (used on high zoom)
 - **Cache key**: file content hash + point count + window range
 - Frontend requests waveform via `request_waveform_overview` with optional `windowStartSec`/`windowEndSec` for detail views
+- Frontend waveform viewport is horizontally scrollable when zoom exceeds visible width
+
+### DSP system
+
+- `DspSettings` is the primary controllable processing model
+- UI uses a **draft / apply** workflow to avoid rebuilding the playback chain on every slider move
+- New files default to DSP preset `off`
+- Built-in preset: `upstairs_voice_footsteps`
+- Browser fallback only guarantees UI state consistency; desktop Tauri path is the primary DSP implementation target
 
 ## Conventions
 
@@ -66,3 +80,4 @@ Tauri events pushed from backend to frontend:
 - Rust structs exposed to frontend use `#[serde(rename_all = "camelCase")]`
 - Do not edit `dist/` or `src-tauri/target/` — they are generated output
 - Commit style: concise imperative, e.g. "Add cached viewport waveform loading"
+- Keep bridge contracts aligned across `src/types.ts`, `src/lib/tauriBridge.ts`, and `src-tauri/src/main.rs`

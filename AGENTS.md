@@ -3,11 +3,11 @@
 ## Project Structure & Module Organization
 
 - `src/`: React frontend application.
-- `src/App.tsx`: main desktop player flow, waveform request policy, and UI state.
+- `src/App.tsx`: main desktop player flow, bilingual UI, DSP draft/apply workflow, and waveform request policy.
 - `src/components/`: reusable UI pieces such as `WaveformCanvas.tsx`.
 - `src/lib/`: frontend bridge code for Tauri communication.
-- `src/types.ts`: shared frontend-side payload and player state definitions.
-- `src-tauri/src/main.rs`: Rust backend entrypoint, playback control, waveform generation, cache handling, and Tauri commands.
+- `src/types.ts`: shared frontend-side payload and player state definitions, including DSP settings.
+- `src-tauri/src/main.rs`: Rust backend entrypoint, playback control, real-time DSP chain, waveform generation, cache handling, and Tauri commands.
 - `src-tauri/icons/`: desktop app icons.
 - `dist/`: frontend build output. Do not edit manually.
 
@@ -19,6 +19,7 @@
 - `npx tsc --noEmit`: frontend type-check only.
 - `cd src-tauri && cargo check`: compile-check the Rust/Tauri backend.
 - `npx tauri dev`: run the desktop app in development mode when local Tauri prerequisites are installed.
+- If `cargo check` complains about missing `../dist`, run `npm run build` first.
 
 ## Coding Style & Naming Conventions
 
@@ -34,16 +35,17 @@
   - `npx tsc --noEmit`
   - `npm run build`
   - `cd src-tauri && cargo check`
-- For audio or waveform changes, manually verify file open, playback, seek, EQ, zoom, and waveform updates with a local `wav` or `mp3`.
+- For audio or waveform changes, manually verify file open, playback, seek, EQ, speed, zoom, waveform hover, and waveform horizontal scroll with a local `wav` or `mp3`.
+- For DSP changes, manually verify preset switching, parameter draft/apply flow, and parameter persistence across seek / restart / playback-rate changes.
 - For waveform work, verify both overview and high-zoom detail requests and confirm cached reload behavior.
 
 ## Commit & Pull Request Guidelines
 
 - Follow the existing concise imperative style, for example: `Initial large audio player prototype`.
-- Keep commits focused by subsystem, such as frontend UI, waveform backend, or playback pipeline.
+- Keep commits focused by subsystem, such as frontend UI, waveform backend, playback pipeline, or DSP chain.
 - PRs should include:
   - a short summary of user-visible changes
-  - affected areas (`frontend`, `playback`, `waveform`, `tauri`)
+  - affected areas (`frontend`, `playback`, `waveform`, `dsp`, `tauri`)
   - screenshots or short recordings for UI changes
   - manual verification steps and sample file types tested
 
