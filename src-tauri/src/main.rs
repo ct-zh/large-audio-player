@@ -41,7 +41,7 @@ struct AppState {
     current_file: Mutex<Option<AudioMeta>>,
     playback: PlaybackController,
     waveform_generation: AtomicU64,
-    waveform_cache: Mutex<HashMap<String, HashMap<String, Vec<WaveformPoint>>>>,
+    waveform_cache: Mutex<HashMap<String, HashMap<String, WaveformOverviewPayload>>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,7 +50,7 @@ struct AudioMeta {
     path: String,
     file_name: String,
     file_size: u64,
-    duration_sec: u64,
+    duration_sec: f64,
     sample_rate: u32,
     channels: u16,
 }
@@ -126,7 +126,7 @@ struct WaveformPoint {
     max: f32,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WaveformOverviewPayload {
     points: Vec<WaveformPoint>,
@@ -613,6 +613,14 @@ impl WaveformAccumulator {
             .map(|total| (self.processed_frames as f32 / total as f32).clamp(0.0, 1.0))
     }
 
+    fn processed_duration_sec(&self, sample_rate: f64) -> f64 {
+        if sample_rate <= 0.0 {
+            return 0.0;
+        }
+
+        self.processed_frames as f64 / sample_rate
+    }
+
     fn finalize(mut self) -> Vec<WaveformPoint> {
         if self.total_frames.is_some() {
             return self
@@ -686,6 +694,12 @@ fn decode_error(error: SymphoniaError) -> String {
     }
 }
 
+fn duration_from_playback_decoder(path: &Path) -> Option<f64> {
+    let file = File::open(path).ok()?;
+    let decoder = RodioDecoder::try_from(BufReader::new(file)).ok()?;
+    decoder.total_duration().map(|duration| duration.as_secs_f64())
+}
+
 fn open_decoding_context(path: &Path) -> Result<DecodingContext, String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
     let file_size = file.metadata().map_err(|error| error.to_string())?.len();
@@ -726,8 +740,11 @@ fn open_decoding_context(path: &Path) -> Result<DecodingContext, String> {
         .unwrap_or("audio-file")
         .to_string();
 
-    let mut duration_sec = duration_from_codec_params(&codec_params);
-    if duration_sec == 0 {
+    let mut duration_sec = duration_from_playback_decoder(path).unwrap_or(0.0);
+    if duration_sec == 0.0 {
+        duration_sec = duration_from_codec_params(&codec_params);
+    }
+    if duration_sec == 0.0 {
         duration_sec = estimate_duration_from_packets(path, track_id, &codec_params)?;
     }
 
@@ -751,18 +768,18 @@ fn open_decoding_context(path: &Path) -> Result<DecodingContext, String> {
     })
 }
 
-fn duration_from_codec_params(codec_params: &CodecParameters) -> u64 {
+fn duration_from_codec_params(codec_params: &CodecParameters) -> f64 {
     if let (Some(frame_count), Some(sample_rate)) = (codec_params.n_frames, codec_params.sample_rate)
     {
-        return ((frame_count as f64) / (sample_rate as f64)).ceil() as u64;
+        return (frame_count as f64) / (sample_rate as f64);
     }
 
     if let (Some(frame_count), Some(time_base)) = (codec_params.n_frames, codec_params.time_base) {
         let time = time_base.calc_time(frame_count);
-        return time.seconds + u64::from(time.frac > 0.0);
+        return time.seconds as f64 + time.frac;
     }
 
-    0
+    0.0
 }
 
 fn seconds_from_timestamp(timestamp: u64, codec_params: &CodecParameters) -> Option<f64> {
@@ -785,7 +802,7 @@ fn estimate_duration_from_packets(
     path: &Path,
     track_id: u32,
     codec_params: &CodecParameters,
-) -> Result<u64, String> {
+) -> Result<f64, String> {
     let file = File::open(path).map_err(|error| error.to_string())?;
 
     let mut hint = Hint::new();
@@ -824,9 +841,7 @@ fn estimate_duration_from_packets(
         duration_ts = duration_ts.max(packet.ts().saturating_add(packet.dur()));
     }
 
-    Ok(seconds_from_timestamp(duration_ts, codec_params)
-        .map(|seconds| seconds.ceil() as u64)
-        .unwrap_or(0))
+    Ok(seconds_from_timestamp(duration_ts, codec_params).unwrap_or(0.0))
 }
 
 fn append_audio_buffer_windowed(
@@ -914,7 +929,7 @@ fn load_waveform_from_disk(
     window_start_sec: f64,
     window_end_sec: f64,
     app: &AppHandle,
-) -> Result<Option<Vec<WaveformPoint>>, String> {
+) -> Result<Option<WaveformOverviewPayload>, String> {
     let cache_file =
         waveform_cache_file(path, point_count, window_start_sec, window_end_sec, app)?;
 
@@ -923,9 +938,9 @@ fn load_waveform_from_disk(
     }
 
     let contents = fs::read_to_string(cache_file).map_err(|error| error.to_string())?;
-    let points =
-        serde_json::from_str::<Vec<WaveformPoint>>(&contents).map_err(|error| error.to_string())?;
-    Ok(Some(points))
+    let payload = serde_json::from_str::<WaveformOverviewPayload>(&contents)
+        .map_err(|error| error.to_string())?;
+    Ok(Some(payload))
 }
 
 fn save_waveform_to_disk(
@@ -933,12 +948,12 @@ fn save_waveform_to_disk(
     point_count: usize,
     window_start_sec: f64,
     window_end_sec: f64,
-    points: &[WaveformPoint],
+    payload: &WaveformOverviewPayload,
     app: &AppHandle,
 ) -> Result<(), String> {
     let cache_file =
         waveform_cache_file(path, point_count, window_start_sec, window_end_sec, app)?;
-    let contents = serde_json::to_string(points).map_err(|error| error.to_string())?;
+    let contents = serde_json::to_string(payload).map_err(|error| error.to_string())?;
     fs::write(cache_file, contents).map_err(|error| error.to_string())
 }
 
@@ -1064,12 +1079,17 @@ fn build_waveform_overview(
         return Ok(());
     }
 
+    let actual_window_end_sec = match frame_start {
+        Some(start) => (start as f64 / sample_rate) + accumulator.processed_duration_sec(sample_rate),
+        None => accumulator.processed_duration_sec(sample_rate),
+    };
+
     let ready_payload = WaveformOverviewPayload {
         points: accumulator.finalize(),
         progress: 1.0,
         resolution: resolution.to_string(),
         window_start_sec,
-        window_end_sec,
+        window_end_sec: actual_window_end_sec.max(window_start_sec),
     };
 
     if let Ok(mut cache) = state.waveform_cache.lock() {
@@ -1083,8 +1103,16 @@ fn build_waveform_overview(
             .or_default()
             .insert(
                 waveform_memory_key(point_count, window_start_sec, window_end_sec),
-                ready_payload.points.clone(),
+                ready_payload.clone(),
             );
+    }
+
+    if window_start_sec == 0.0 {
+        if let Ok(mut current) = state.current_file.lock() {
+            if let Some(audio_meta) = current.as_mut().filter(|audio_meta| audio_meta.path == path) {
+                audio_meta.duration_sec = ready_payload.window_end_sec;
+            }
+        }
     }
 
     let _ = save_waveform_to_disk(
@@ -1092,7 +1120,7 @@ fn build_waveform_overview(
         point_count,
         window_start_sec,
         window_end_sec,
-        &ready_payload.points,
+        &ready_payload,
         &app,
     );
 
@@ -1103,7 +1131,7 @@ fn build_waveform_overview(
             progress: 1.0,
             resolution: resolution.to_string(),
             window_start_sec,
-            window_end_sec,
+            window_end_sec: ready_payload.window_end_sec,
         },
     );
     let _ = app.emit("waveform_overview_ready", ready_payload);
@@ -1522,11 +1550,11 @@ fn request_waveform_overview(
             current
                 .as_ref()
                 .filter(|audio_meta| audio_meta.path == path)
-                .map(|audio_meta| audio_meta.duration_sec as f64)
+                .map(|audio_meta| audio_meta.duration_sec)
         }) {
         duration_sec
     } else {
-        open_decoding_context(Path::new(&path))?.audio_meta.duration_sec as f64
+        open_decoding_context(Path::new(&path))?.audio_meta.duration_sec
     };
     let requested_window_start = window_start_sec.unwrap_or(0.0).max(0.0);
     let requested_window_end = window_end_sec
@@ -1540,8 +1568,20 @@ fn request_waveform_overview(
         "overview"
     };
 
+    let update_current_duration = |next_duration_sec: f64| {
+        if requested_window_start > 0.0 {
+            return;
+        }
+
+        if let Ok(mut current) = state.current_file.lock() {
+            if let Some(audio_meta) = current.as_mut().filter(|audio_meta| audio_meta.path == path) {
+                audio_meta.duration_sec = next_duration_sec.max(0.0);
+            }
+        }
+    };
+
     if let Ok(cache) = state.waveform_cache.lock() {
-        if let Some(points) = cache
+        if let Some(payload) = cache
             .get(&path)
             .and_then(|layers| {
                 layers.get(&waveform_memory_key(
@@ -1552,25 +1592,20 @@ fn request_waveform_overview(
             })
             .cloned()
         {
-            let payload = WaveformOverviewPayload {
-                points,
-                progress: 1.0,
-                resolution: resolution.to_string(),
-                window_start_sec: requested_window_start,
-                window_end_sec: requested_window_end,
-            };
+            update_current_duration(payload.window_end_sec);
             let _ = app.emit("waveform_overview_ready", payload.clone());
             return Ok(payload);
         }
     }
 
-    if let Ok(Some(points)) = load_waveform_from_disk(
+    if let Ok(Some(payload)) = load_waveform_from_disk(
         &path,
         requested_points,
         requested_window_start,
         requested_window_end,
         &app,
     ) {
+        update_current_duration(payload.window_end_sec);
         if let Ok(mut cache) = state.waveform_cache.lock() {
             cache.entry(path.clone())
                 .or_default()
@@ -1580,17 +1615,9 @@ fn request_waveform_overview(
                         requested_window_start,
                         requested_window_end,
                     ),
-                    points.clone(),
+                    payload.clone(),
                 );
         }
-
-        let payload = WaveformOverviewPayload {
-            points,
-            progress: 1.0,
-            resolution: resolution.to_string(),
-            window_start_sec: requested_window_start,
-            window_end_sec: requested_window_end,
-        };
         let _ = app.emit("waveform_overview_ready", payload.clone());
         return Ok(payload);
     }

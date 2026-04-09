@@ -79,8 +79,8 @@ const contentByLocale = {
   "zh-CN": {
     localeLabel: "中文",
     productName: "大文件音频播放器",
-    heroTitle: "像摆弄糖果色旋钮一样，轻松操控超大音频文件。",
-    heroDescription: "支持本地 WAV / MP3 打开、播放、调参与波形查看。",
+    heroTitle: "用于打开和处理大体积音频文件。",
+    heroDescription: "支持本地 WAV / MP3 的播放、调参与波形查看。",
     statusLoading: "正在准备播放并生成波形预览",
     statusIdle: "拖入本地 WAV / MP3 文件开始播放",
     statusReady: "播放器已经就绪",
@@ -92,7 +92,7 @@ const contentByLocale = {
     importPanelDescription: "选择或拖入本地音频文件。",
     chooseAudio: "选择音频文件",
     openSystemDialog: "使用系统对话框",
-    dragHint: "也可以直接把文件拖到右侧播放器区域。",
+    dragHint: "也可以直接把文件拖到右侧播放器中。",
     chainPanelTitle: "音频链路",
     chainPanelDescription: "调整增益与三段 EQ。",
     gain: "音量",
@@ -108,10 +108,10 @@ const contentByLocale = {
     paletteSunset: "奶桃晚霞",
     paletteMono: "云雾牛奶",
     nowPlaying: "当前文件",
-    playerBadge: "固定播放器舞台",
+    playerBadge: "播放器",
     playerSummary: "显示波形、时间线和播放控制。",
     emptyEyebrow: "尚未载入文件",
-    emptyTitle: "把 WAV 或 MP3 放进这块糖果色舞台。",
+    emptyTitle: "载入 WAV 或 MP3 文件。",
     emptyDescription: "拖入或选择一个本地 WAV / MP3 文件开始使用。",
     emptyDescriptionSecondary: "桌面环境下也可以使用系统文件对话框打开音频。",
     dropTitle: "松手即可打开音频",
@@ -164,8 +164,8 @@ const contentByLocale = {
   "en-US": {
     localeLabel: "EN",
     productName: "Large Audio Player",
-    heroTitle: "Handle oversized audio like a tray of pastel knobs and candy switches.",
-    heroDescription: "Open local WAV / MP3 files for playback, tuning, and waveform viewing.",
+    heroTitle: "Open and work with large audio files.",
+    heroDescription: "Supports local WAV / MP3 playback, tuning, and waveform viewing.",
     statusLoading: "Preparing playback and building the waveform preview",
     statusIdle: "Drop a local WAV or MP3 file to begin",
     statusReady: "Player ready",
@@ -177,7 +177,7 @@ const contentByLocale = {
     importPanelDescription: "Choose or drop a local audio file.",
     chooseAudio: "Choose audio",
     openSystemDialog: "Open native dialog",
-    dragHint: "You can also drop a file directly onto the player stage.",
+    dragHint: "You can also drop a file directly into the player.",
     chainPanelTitle: "Audio Chain",
     chainPanelDescription: "Adjust gain and three-band EQ.",
     gain: "Volume",
@@ -193,10 +193,10 @@ const contentByLocale = {
     paletteSunset: "Peach Glow",
     paletteMono: "Milk Fog",
     nowPlaying: "Now Playing",
-    playerBadge: "Pinned Player Stage",
+    playerBadge: "Player",
     playerSummary: "Shows waveform, timeline, and transport controls.",
     emptyEyebrow: "No file loaded",
-    emptyTitle: "Drop a WAV or MP3 into this pastel stage.",
+    emptyTitle: "Load a WAV or MP3 file.",
     emptyDescription: "Drop or choose a local WAV or MP3 file to begin.",
     emptyDescriptionSecondary: "Desktop mode can also open audio from the native file dialog.",
     dropTitle: "Release to open audio",
@@ -331,6 +331,39 @@ const waveformWindowForView = (durationSec: number, currentTimeSec: number, zoom
     windowEndSec: Math.min(durationSec, start + spanSec)
   };
 };
+
+const resolveDurationFromWaveform = (
+  prevDurationSec: number,
+  payload: Pick<WaveformOverviewPayload, "progress" | "windowStartSec" | "windowEndSec">
+) => {
+  if (payload.progress < 1 || payload.windowStartSec > 0) {
+    return prevDurationSec;
+  }
+
+  return payload.windowEndSec > 0 ? payload.windowEndSec : prevDurationSec;
+};
+
+const readDurationFromFile = async (file: File) =>
+  new Promise<number>((resolve) => {
+    const objectUrl = URL.createObjectURL(file);
+    const probe = document.createElement("audio");
+
+    const finalize = (durationSec: number) => {
+      probe.removeAttribute("src");
+      probe.load();
+      URL.revokeObjectURL(objectUrl);
+      resolve(Number.isFinite(durationSec) && durationSec > 0 ? durationSec : 0);
+    };
+
+    probe.preload = "metadata";
+    probe.onloadedmetadata = () => {
+      finalize(probe.duration);
+    };
+    probe.onerror = () => {
+      finalize(0);
+    };
+    probe.src = objectUrl;
+  });
 
 function App() {
   const [state, setState] = useState<PlayerState>(initialState);
@@ -553,14 +586,26 @@ function App() {
   };
 
   const handleWaveformUpdate = (payload: WaveformOverviewPayload) => {
-    setState((prev) => ({
-      ...prev,
-      waveform: payload.points.length > 0 ? payload.points : prev.waveform,
-      waveformProgress: payload.progress,
-      phase: prev.audioMeta ? "ready" : prev.phase,
-      waveformWindowStartSec: payload.windowStartSec,
-      waveformWindowEndSec: payload.windowEndSec
-    }));
+    setState((prev) => {
+      const resolvedDurationSec = resolveDurationFromWaveform(prev.durationSec, payload);
+
+      return {
+        ...prev,
+        audioMeta: prev.audioMeta
+          ? {
+              ...prev.audioMeta,
+              durationSec: resolvedDurationSec
+            }
+          : prev.audioMeta,
+        waveform: payload.points.length > 0 ? payload.points : prev.waveform,
+        waveformProgress: payload.progress,
+        phase: prev.audioMeta ? "ready" : prev.phase,
+        durationSec: resolvedDurationSec,
+        currentTimeSec: Math.min(prev.currentTimeSec, resolvedDurationSec),
+        waveformWindowStartSec: payload.windowStartSec,
+        waveformWindowEndSec: payload.windowEndSec
+      };
+    });
   };
 
   const loadAudio = async (source: { path: string; file?: File }) => {
@@ -581,14 +626,19 @@ function App() {
     setDraftDsp(cloneDspSettings(initialState.dsp));
 
     try {
+      const preciseDurationSec = source.file ? await readDurationFromFile(source.file) : 0;
       const { audioMeta } = await bridge.openAudio(source.path, source.file);
+      const resolvedMeta = {
+        ...audioMeta,
+        durationSec: preciseDurationSec > 0 ? preciseDurationSec : audioMeta.durationSec
+      };
 
       if (openRequestIdRef.current !== loadId) {
         return;
       }
 
       if (source.file) {
-        await applyMetaToLocalAudio(source.file, audioMeta);
+        await applyMetaToLocalAudio(source.file, resolvedMeta);
 
         if (openRequestIdRef.current !== loadId) {
           return;
@@ -596,8 +646,8 @@ function App() {
       } else {
         setState((prev) => ({
           ...prev,
-          audioMeta,
-          durationSec: audioMeta.durationSec,
+          audioMeta: resolvedMeta,
+          durationSec: resolvedMeta.durationSec,
           currentTimeSec: 0
         }));
       }
@@ -607,18 +657,23 @@ function App() {
         source.file,
         waveformTargetPoints(view.zoom),
         0,
-        audioMeta.durationSec
+        resolvedMeta.durationSec
       );
 
       if (openRequestIdRef.current !== loadId) {
         return;
       }
 
+      const resolvedDurationSec = resolveDurationFromWaveform(resolvedMeta.durationSec, overview);
+
       setState((prev) => ({
         ...prev,
         phase: "ready",
-        audioMeta,
-        durationSec: audioMeta.durationSec,
+        audioMeta: {
+          ...resolvedMeta,
+          durationSec: resolvedDurationSec
+        },
+        durationSec: resolvedDurationSec,
         waveform: overview.points,
         waveformProgress: overview.progress,
         waveformWindowStartSec: overview.windowStartSec,
@@ -1321,7 +1376,12 @@ function App() {
                     </div>
                   </div>
                   <label className="timeline-block">
-                    <span>{copy.progressLabel}</span>
+                    <span className="timeline-label-row">
+                      <span>{copy.progressLabel}</span>
+                      <span className="timeline-duration">
+                        {formatTime(state.currentTimeSec)} / {formatTime(state.durationSec)}
+                      </span>
+                    </span>
                     <input
                       className="seek-bar"
                       type="range"

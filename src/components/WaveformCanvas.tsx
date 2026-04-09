@@ -73,16 +73,41 @@ export function WaveformCanvas({
   const lastManualScrollAtRef = useRef(0);
   const lastAutoScrollAtRef = useRef(0);
   const [hoverState, setHoverState] = useState<{ x: number; timeSec: number } | null>(null);
+  const [viewportWidth, setViewportWidth] = useState(0);
   const palette = useMemo(() => colorsByScheme[view.colorScheme], [view.colorScheme]);
 
   const cssHeight = 390;
-  const barWidth = Math.max(2, view.zoom * 2.4);
-  const contentWidth = Math.max(640, Math.ceil(points.length * barWidth));
+  const baseViewportWidth = Math.max(640, viewportWidth || 0);
+  const contentWidth = Math.max(baseViewportWidth, Math.ceil(baseViewportWidth * Math.max(view.zoom, 1)));
+  const barWidth = points.length > 0 ? contentWidth / points.length : contentWidth;
   const contentSpanSec = Math.max(
     0.001,
     windowEndSec > windowStartSec ? windowEndSec - windowStartSec : durationSec
   );
   const isWindowed = windowEndSec > windowStartSec && contentSpanSec < Math.max(durationSec, 0.001);
+
+  useEffect(() => {
+    const viewport = viewportRef.current;
+
+    if (!viewport) {
+      return;
+    }
+
+    const updateViewportWidth = () => {
+      setViewportWidth(viewport.clientWidth);
+    };
+
+    updateViewportWidth();
+
+    const observer = new ResizeObserver(() => {
+      updateViewportWidth();
+    });
+
+    observer.observe(viewport);
+    return () => {
+      observer.disconnect();
+    };
+  }, []);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -138,8 +163,9 @@ export function WaveformCanvas({
       const top = midY - point.max * amplitudeScale;
       const bottom = midY - point.min * amplitudeScale;
       const height = Math.max(2, bottom - top);
+      const drawWidth = Math.max(1, barWidth - 1);
 
-      context.fillRect(x, top, Math.max(1.5, barWidth - 1), height);
+      context.fillRect(x, top, drawWidth, height);
     }
 
     context.shadowBlur = 0;
